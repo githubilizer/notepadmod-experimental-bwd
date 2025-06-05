@@ -1,0 +1,36 @@
+.qodo
+
+# Virtual environments
+.venv/
+venv/
+__pycache__/
+
+# Logs and temporary files
+*.log
+output.log
+
+# Environment and API keys
+.env
+*apikey*
+*API_KEY*
+*.sh
+scripts/FT archive/
+scripts/old_scripts/
+scripts/**/test_model*
+scripts/scriptTesting/
+scripts/gps*.py
+scripts/model*.py
+scripts/last*.py
+scripts/intro.py
+scripts/outro.py
+scripts/STBC*.py
+scripts/STB.py
+scripts/ReFlow.py
+scripts/SkepticalOutro.py
+
+# Thumbnails and large files
+thumbnails/
+
+# Backup files
+*conflicted copy*
+*Copy*

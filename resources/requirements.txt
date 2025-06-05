@@ -1,0 +1,5 @@
+PyQt5
+qdarkstyle
+nltk
+pyspellchecker
+openai

@@ -1,0 +1,3601 @@
+# notepad_app/modules/notepad_window.py
+
+import sys
+import os
+import logging
+import re
+import requests  # Ensure requests is installed: pip install requests
+import urllib.parse
+import subprocess
+import tempfile
+import time
+import shutil
+import base64
+import json # For Ollama API interaction
+
+# Add the project root directory to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
+from PyQt5.QtCore import Qt, QSize, QPoint, QTimer
+from PyQt5.QtGui import QKeySequence
+from PyQt5.QtWidgets import (
+    QMainWindow, QTabWidget, QToolBar, QAction, QFileDialog, QMessageBox,
+    QMenu, QWidgetAction, QDialog, QVBoxLayout, QLabel,
+    QScrollArea, QWidget, QHBoxLayout, QPushButton, QToolButton, QPlainTextEdit,
+    QSplitter, QGridLayout, QApplication, QSizePolicy
+)
+from PyQt5.QtGui import QIcon, QFont, QPixmap, QTextCursor
+from PyQt5.QtGui import QPixmap
+
+from modules.editor import Editor
+from modules.backup import Backup
+from modules.find_dialog import FindDialog
+from modules.script_runner import ScriptRunner
+from modules.recent_files import RecentFiles
+
+import qdarkstyle
+from scripts.text2png_ALL_v3 import create_image
+
+class NotepadWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Custom Notepad")
+        
+        # Set window size to half of QHD width and full height
+        self.resize(1280, 1400)  # Half of 2560 for width, slightly less than 1440 for height to account for taskbar
+        
+        # Get the available screen geometry
+        screen = QApplication.primaryScreen().availableGeometry()
+        
+        # Calculate position to place window on right half
+        x = screen.x() + int(screen.width() / 2)  # Start at the middle of the screen, including screen offset
+        y = screen.y()  # Account for screen's y offset
+        
+        # Move window to position
+        self.move(x, y)
+        
+        # Set logging level to ERROR to suppress warnings
+        logging.getLogger().setLevel(logging.ERROR)
+
+        # Config file for last opened file
+        self.config_dir = os.path.expanduser("~/.config/notepadmod")
+        self.config_file = os.path.join(self.config_dir, "last_file.txt")
+        
+        # Media file extensions
+        self.media_extensions = {
+            'video': ['.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv', '.wmv'],
+            'audio': ['.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac']
+        }
+
+        # Initialize search directories for images
+        self.search_dirs = [
+            "/home/j/Desktop",
+            "/home/j/Videos/untv/Ukraine",
+            "/home/j/Downloads",
+            "/home/j/Pictures/Screenshots",
+            "/home/j/Desktop/Nex_day_goodies/UNTV_Extras/rando",
+        ]
+        self.destination_dir = "/home/j/Desktop/ScriptKing/temp_pics"
+        self.bsqs_dir = "/home/j/Desktop/YTs/aa UNTV Today/bsqs"
+        self.generic_bsq = "/home/j/Desktop/YTs/aa UNTV Today/bsqs/bsq.png"
+        
+        # Directory for word images
+        self.word_images_dir = "/home/j/Desktop/YTs/aa UNTV Today/notepad_word_images"
+        os.makedirs(self.word_images_dir, exist_ok=True)
+        
+        # Build file index for faster searches
+        self.file_index = {}
+        self.build_file_index()
+
+        # Dictionary to store line numbers for images
+        self.image_line_numbers = {}
+        
+        # Add debounce timer for image updates
+        self._image_update_timer = QTimer()
+        self._image_update_timer.setSingleShot(True)
+        self._image_update_timer.timeout.connect(self._debounced_update_images)
+        self._image_update_delay = 500  # 500ms delay
+
+        # Add debounce timer for scroll sync
+        self._scroll_sync_timer = QTimer()
+        self._scroll_sync_timer.setSingleShot(True)
+        self._scroll_sync_timer.timeout.connect(self._debounced_sync_scroll)
+        self._scroll_sync_delay = 100  # 100ms delay
+
+        # Create a splitter to hold the image viewer and editor/tabs
+        self.splitter = QSplitter(self)
+        self.setCentralWidget(self.splitter)
+
+        # Create a right-side widget to hold editor and tabs
+        self.right_widget = QWidget()
+        self.right_layout = QVBoxLayout(self.right_widget)
+        
+        # Initialize the tabs
+        self.tabs = QTabWidget(self)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)  # Enable tab movement
+        self.tabs.tabCloseRequested.connect(self.closeTab)
+        self.tabs.currentChanged.connect(self.updateImageDisplay)
+        
+        # Make tabs 50% bigger with custom styling
+        self.tabs.setStyleSheet("""
+            QTabBar::tab {
+                height: 36px;  /* 50% taller than default 24px */
+                padding: 8px 16px;  /* Increased padding */
+                font-size: 14px;  /* Larger font */
+                min-width: 150px;  /* Minimum width to prevent tiny tabs */
+                max-width: 400px;  /* Maximum width to prevent excessive tabs */
+                background-color: #1e1e1e;  /* Darker background for inactive tabs */
+            }
+            QTabBar::tab:selected {
+                background-color: #3d3d3d;  /* Much lighter background for active tab */
+                border-bottom: 3px solid #007acc;  /* Blue accent border */
+                font-weight: bold;  /* Make text bold in active tab */
+            }
+            QTabBar::tab:!selected {
+                margin-top: 2px;  /* Shift unselected tabs down slightly */
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: #2d2d2d;  /* Slightly lighter on hover */
+            }
+        """)
+        
+        # Create a horizontal splitter for editor area and title segments
+        self.editor_splitter = QSplitter(Qt.Horizontal)
+        
+        # Add the tabs to the editor splitter
+        self.editor_splitter.addWidget(self.tabs)
+        
+        # Create a scroll area for the title segments
+        self.title_segments_scroll = QScrollArea()
+        self.title_segments_scroll.setWidgetResizable(True)
+        self.title_segments_scroll.setMinimumWidth(150)
+        self.title_segments_scroll.setMaximumWidth(200)
+        self.title_segments_scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: #1e1e1e;
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: #1e1e1e;
+            }
+        """)
+        
+        # Create container widget for title segments
+        self.title_segments_container = QWidget()
+        self.title_segments_container.setStyleSheet("""
+            QWidget {
+                background-color: #1e1e1e;
+            }
+            QPushButton {
+                text-align: left;
+                padding: 8px;
+                border: none;
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-size: 14px;  /* Increased from 12px to 14px */
+                width: 100%;
+                margin: 0;
+            }
+            QPushButton:hover {
+                background-color: #2d2d2d;
+            }
+            QPushButton:pressed {
+                background-color: #3d3d3d;
+            }
+        """)
+        
+        # Create layout for title segments
+        self.title_segments_layout_inner = QVBoxLayout(self.title_segments_container)
+        self.title_segments_layout_inner.setContentsMargins(0, 0, 0, 0)
+        self.title_segments_layout_inner.setSpacing(0)
+        self.title_segments_layout_inner.addStretch()
+        
+        self.title_segments_scroll.setWidget(self.title_segments_container)
+        
+        # Create a container widget for the title segments scroll area
+        self.title_segments_widget = QWidget()
+        self.title_segments_widget.setStyleSheet("background-color: #1e1e1e;")
+        self.title_segments_layout = QVBoxLayout(self.title_segments_widget)
+        self.title_segments_layout.setContentsMargins(0, 0, 0, 0)
+        self.title_segments_layout.setSpacing(0)
+        self.title_segments_layout.addWidget(self.title_segments_scroll)
+        
+        # Add the title segments widget directly after the tabs widget
+        self.editor_splitter.insertWidget(1, self.title_segments_widget)
+        
+        # Set the editor splitter proportions (6:1 ratio for editor:title_segments)
+        self.editor_splitter.setSizes([900, 150])
+        
+        # Make the editor splitter handle visible
+        self.editor_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #2d2d2d;
+                width: 2px;
+            }
+        """)
+        
+        # Add the editor splitter to the right layout
+        self.right_layout.addWidget(self.editor_splitter)
+        
+        # Add the right widget to the main splitter
+        self.splitter.addWidget(self.right_widget)
+
+        # Create a scroll area for the image viewer on the right
+        self.image_scroll = QScrollArea()
+        self.image_scroll.setWidgetResizable(True)
+        self.image_scroll.setMinimumWidth(300)  # Set minimum width for image pane
+        
+        # Create a widget to hold multiple images
+        self.image_container = QWidget()
+        self.image_layout = QGridLayout(self.image_container)
+        self.image_layout.setAlignment(Qt.AlignHCenter | Qt.AlignTop)  # Center horizontally, align top vertically
+        self.image_layout.setContentsMargins(20, 20, 20, 20)  # Add some padding around the edges
+        self.image_layout.setSpacing(20)  # Add space between images
+        self.image_scroll.setWidget(self.image_container)
+        
+        # Add the image scroll area to the right of the splitter
+        self.splitter.addWidget(self.image_scroll)
+
+        # Set the splitter proportions (3:1 ratio for editor:images)
+        self.splitter.setSizes([750, 250])
+        
+        # Set the editor splitter proportions (4:1 ratio for editor:title_segments)
+        self.editor_splitter.setSizes([800, 200])
+
+        # Track image pane visibility
+        self.image_pane_visible = True
+
+        self.backup = Backup(self)
+        self.script_runner = ScriptRunner(self)
+        self.search_widget = None
+
+        self.createActions()
+        self.createMenus()
+        self.createToolBar()
+
+        # Keep cpyimages, c6sort, double-dash, and segment sorter
+        self.createCpyImagesButton()
+        self.createC6SortButton()
+        self.createDoubleDashButton()
+        self.createSegmentSorterButton()
+
+        self.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
+        self.setAcceptDrops(True)
+        self.statusBar().showMessage("Ready")
+        self.statusBar().setStyleSheet("QStatusBar { min-height: 40px; font-size: 20px; }")
+
+        self.initializeRecentFiles()
+
+        logging.debug("NotepadWindow initialized.")
+
+        # Connect text change signal to update title segments
+        self.tabs.currentChanged.connect(self.updateTitleSegments)
+
+        self.last_modified_time = None
+        self.current_file = None
+        
+        # Set up timer to check for external changes every 2 seconds
+        self.check_timer = QTimer(self)
+        self.check_timer.timeout.connect(self.check_external_changes)
+        self.check_timer.start(2000)
+
+    def initializeRecentFiles(self):
+        menubar = self.menuBar()
+        recent_menu = None
+
+        # Find the "Edit" menu action
+        edit_menu_action = None
+        for action in menubar.actions():
+            if action.text() == "&Edit":
+                edit_menu_action = action
+                break
+
+        if not edit_menu_action:
+            # If "Edit" menu is not found, add "Recent" normally
+            recent_menu = menubar.addMenu("&Recent")
+        else:
+            # Create the "Recent" menu
+            recent_menu = menubar.addMenu("&Recent")
+            # Insert "Recent" after the "Edit" menu
+            menubar.insertMenu(edit_menu_action, recent_menu)
+
+        self.recent_files = RecentFiles(
+            parent=self,
+            menu=recent_menu,
+            max_files=20,
+            recent_files_path="/home/j/Desktop/notepadmod/recentfiles.txt"
+        )
+
+        # Try to open the last file that was open
+        last_file, cursor_pos, scroll_pos = self.load_last_file()
+        if last_file and os.path.exists(last_file):
+            self.openFile(last_file, cursor_pos, scroll_pos)
+        else:
+            # If no last file exists, just create a new tab
+            self.newTab()
+
+    def createActions(self):
+        # File actions
+        self.newAct = QAction("New", self, shortcut="Ctrl+N", triggered=self.newTab)
+        self.openAct = QAction("Open", self, shortcut="Ctrl+O", triggered=self.openDialog)
+        self.saveAct = QAction("Save", self, shortcut="Ctrl+S", triggered=self.saveFile)
+        self.saveAsAct = QAction("Save As", self)
+        self.saveAsAct.setShortcut("Ctrl+Shift+S")
+        self.saveAsAct.setShortcutContext(Qt.ApplicationShortcut)
+        self.saveAsAct.triggered.connect(self.saveFileAs)
+        self.addAction(self.saveAsAct)  # Add to window to enable the shortcut
+        self.backupAct = QAction("Backup", self, triggered=self.backup.backupCurrentFile)
+        self.closeTabAct = QAction("Close Tab", self, shortcut="Ctrl+W", triggered=self.closeCurrentTab)
+        
+        # Edit actions
+        self.cutAct = QAction("Cut", self, shortcut="Ctrl+X", triggered=self.cutText)
+        self.copyAct = QAction("Copy", self, shortcut="Ctrl+C", triggered=self.copyText)
+        self.pasteAct = QAction("Paste", self, shortcut="Ctrl+V", triggered=self.pasteText)
+        self.findAct = QAction("Find", self, shortcut="Ctrl+F", triggered=self.openFindDialog)
+        
+        # Add intro toolbar action
+        self.runIntroToolbarAct = QAction("intro", self)
+        self.runIntroToolbarAct.setToolTip("Intro - Generate text flow from header")
+        self.runIntroToolbarAct.triggered.connect(self.script_runner.runIntroScript)
+        
+        # Add QQ toolbar action
+        self.runQQToolbarAct = QAction("QQ", self)
+        self.runQQToolbarAct.setToolTip("QQ - Quoted question")
+        self.runQQToolbarAct.triggered.connect(self.script_runner.runQqScript)
+        
+        # Add Context toolbar action
+        self.runContextToolbarAct = QAction("Context", self)
+        self.runContextToolbarAct.setToolTip("Context - Add explanation for highlighted text")
+        self.runContextToolbarAct.triggered.connect(self.script_runner.runContextScript)
+        
+        # Add STB button to toolbar actions
+        self.runSTBToolbarAct = QAction("STB-", self, triggered=self.runSTBScript)
+        self.runSTBToolbarAct.setToolTip("STB- - Rewrite and improve text")
+        
+        # Add STBC button to toolbar actions
+        self.runSTBCToolbarAct = QAction("STBC", self)
+        self.runSTBCToolbarAct.setToolTip("STBC - Rewrite with context awareness")
+        self.runSTBCToolbarAct.triggered.connect(self.runSTBCScript)
+        
+        # Add Grammar button to toolbar
+        self.runGrammarToolbarAct = QAction("Grammar", self, triggered=self.runModifierScript)
+        self.runGrammarToolbarAct.setToolTip("Grammar - Fix grammar in selected text")
+
+        # Add TMaker action 
+        self.tMakerAct = QAction("TMaker", self, triggered=self.transformWordToTitle)
+        self.tMakerAct.setToolTip("TMaker - Transform word to Title format")
+        self.tMakerAct.setShortcut("Alt+T")  # Add shortcut key
+        self.tMakerAct.setShortcutContext(Qt.ApplicationShortcut)
+        self.addAction(self.tMakerAct)  # Add to window to enable the shortcut
+
+        # Add GPS action
+        self.runGpsToolbarAct = QAction("gps", self, triggered=self.runGpsScript)
+        self.runGpsToolbarAct.setToolTip("gps - Convert to decimal GPS coordinates")
+        self.runGpsToolbarAct.setShortcut("Alt+G")
+        self.runGpsToolbarAct.setShortcutContext(Qt.ApplicationShortcut)
+        self.addAction(self.runGpsToolbarAct)  # This ensures the shortcut is registered with the application
+
+        # Add DeepState action
+        self.runDeepStateAct = QAction("DeepState", self, triggered=self.convertToDeepStateLink)
+        self.runDeepStateAct.setToolTip("Convert GPS coordinates to DeepState map links")
+
+        # Add segment sorter action
+        self.runSegmentSorterToolbarAct = QAction("segmentmover", self, triggered=self.runSegmentSorter)
+        self.runSegmentSorterToolbarAct.setToolTip("segmentmover - Sort and format text segments - Parent Folder Name: gui71")
+
+        # Script runner actions (menu)
+        self.runTimeSaverMenuAct = QAction("Run timeSaver4445", self, triggered=self.runTimeSaverScript)
+        self.runIntroMenuAct = QAction("Run intro", self, triggered=self.runIntroScript)
+        self.runOutroMenuAct = QAction("Run outro", self, triggered=self.runOutroScript)
+        self.runTs1MenuAct = QAction("Run ts1", self, triggered=self.runTs1Script)
+        self.runQqMenuAct = QAction("Run qq", self, triggered=self.runQqScript)
+        self.runShrtnMenuAct = QAction("Run shrtn", self, triggered=self.runShrtnScript)
+        self.runSynMenuAct = QAction("Run syn", self, triggered=self.runSynScript)
+        self.runTestModelMenuAct = QAction("Run test_model", self, triggered=self.runTestModelScript)
+        self.runTestModelExperimentalMenuAct = QAction("Run test_model_experimental", self, triggered=self.runTestModelExperimentalScript)
+        self.runTestModel3MenuAct = QAction("Run test_model_3", self, triggered=self.runTestModel3Script)
+        self.runTestModel4MenuAct = QAction("Run test_model_4", self, triggered=self.runTestModel4Script)
+
+        # Script runner actions (toolbar)
+        self.runTimeSaverToolbarAct = QAction("timeSaver4445", self, triggered=self.runTimeSaverScript)
+        self.runTimeSaverToolbarAct.setToolTip("timeSaver4445 - Process and format text")
+
+        self.runIntroToolbarAct = QAction("intro", self, triggered=self.runIntroScript)
+        self.runIntroToolbarAct.setToolTip("intro - Generate introduction text")
+
+        self.runOutroToolbarAct = QAction("outro", self, triggered=self.runOutroScript)
+        self.runOutroToolbarAct.setToolTip("outro - Generate conclusion text")
+
+        self.runTs1ToolbarAct = QAction("ts1", self, triggered=self.runTs1Script)
+        self.runTs1ToolbarAct.setToolTip("ts1 - Text processing script 1")
+
+        self.runDeepStateAct = QAction("DeepState", self, triggered=self.convertToDeepStateLink)
+        self.runDeepStateAct.setToolTip("Convert GPS coordinates to DeepState map links")
+
+        self.runQqToolbarAct = QAction("qq", self, triggered=self.runQqScript)
+        self.runQqToolbarAct.setToolTip("qq - Quick query processing")
+
+        self.runShrtnToolbarAct = QAction("shrtn", self, triggered=self.runShrtnScript)
+        self.runShrtnToolbarAct.setToolTip("shrtn - Text shortening tool")
+
+        self.runSynToolbarAct = QAction("syn", self, triggered=self.runSynScript)
+        self.runSynToolbarAct.setToolTip("syn - Syntax processing tool")
+
+        self.runTestModelToolbarAct = QAction("model1", self, triggered=self.runTestModelScript)
+        self.runTestModelToolbarAct.setToolTip("model1 - Test model functionality")
+
+        self.runTestModelExperimentalToolbarAct = QAction("model2", self, triggered=self.runTestModelExperimentalScript)
+        self.runTestModelExperimentalToolbarAct.setToolTip("model2 - Experimental test model functionality")
+
+        self.runTestModel3ToolbarAct = QAction("model3", self, triggered=self.runTestModel3Script)
+        self.runTestModel3ToolbarAct.setToolTip("model3 - Test model 3 functionality")
+
+        self.runTestModel4ToolbarAct = QAction("model4", self, triggered=self.runTestModel4Script)
+        self.runTestModel4ToolbarAct.setToolTip("model4 - Test model 4 functionality")
+
+        # Add toggle image pane action
+        self.toggleImagePaneAct = QAction("Toggle Image Pane", self)
+        self.toggleImagePaneAct.setShortcut("Ctrl+I")
+        self.toggleImagePaneAct.triggered.connect(self.toggleImagePane)
+
+        # Add translate action
+        self.translateAct = QAction("Translate", self)
+        self.translateAct.setToolTip("Translate selected text")
+        self.translateAct.triggered.connect(self.script_runner.runTranslateScript)
+
+        # Add model2i toolbar action
+        self.runModel2iToolbarAct = QAction("model2i", self, triggered=self.runModel2iScript)
+        self.runModel2iToolbarAct.setToolTip("model2i - Test model2i functionality")
+
+        # Add STB button to toolbar actions
+        self.runSTBToolbarAct = QAction("STB-", self, triggered=self.runSTBScript)
+        self.runSTBToolbarAct.setToolTip("STB- - Rewrite and improve text")
+
+        # Add STB menu action (optional, but consistent with other scripts)
+        self.runSTBMenuAct = QAction("Run STB", self, triggered=self.runSTBScript)
+
+        # Add Grammar toolbar action
+        self.runGrammarToolbarAct = QAction("Grammar", self)
+        self.runGrammarToolbarAct.setToolTip("Grammar processing tool")
+        self.runGrammarToolbarAct.triggered.connect(self.script_runner.runGrammarScript)
+
+        # Add Prnc toolbar action
+        self.runPrncToolbarAct = QAction("Prnc", self)
+        self.runPrncToolbarAct.setToolTip("Prnc processing tool")
+        self.runPrncToolbarAct.triggered.connect(self.script_runner.runPronounceScript)
+
+    def createMenus(self):
+        menubar = self.menuBar()
+        menubar.setStyleSheet("""
+            QMenuBar {
+                font-size: 32px;  /* Double the default font size */
+            }
+            QMenu {
+                font-size: 32px;  /* Double the default font size */
+            }
+        """)
+
+        fileMenu = menubar.addMenu("&File")
+        fileMenu.addAction(self.newAct)
+        fileMenu.addAction(self.openAct)
+        fileMenu.addAction(self.saveAct)
+        fileMenu.addAction(self.saveAsAct)
+        fileMenu.addSeparator()
+        fileMenu.addAction(self.backupAct)
+        fileMenu.addAction(self.closeTabAct)
+
+        editMenu = menubar.addMenu("&Edit")
+        editMenu.addAction(self.cutAct)
+        editMenu.addAction(self.copyAct)
+        editMenu.addAction(self.pasteAct)
+        editMenu.addSeparator()
+        editMenu.addAction(self.findAct)
+        editMenu.addSeparator()
+
+        # Existing scripts
+        editMenu.addAction(self.runTimeSaverMenuAct)
+        editMenu.addAction(self.runIntroMenuAct)
+        editMenu.addAction(self.runOutroMenuAct)
+        editMenu.addAction(self.runTs1MenuAct)
+        editMenu.addAction(self.runQqMenuAct)
+        editMenu.addAction(self.runShrtnMenuAct)
+        editMenu.addAction(self.runSynMenuAct)
+        editMenu.addAction(self.runTestModelMenuAct)
+        editMenu.addAction(self.runTestModelExperimentalMenuAct)
+        editMenu.addAction(self.runTestModel3MenuAct)
+        editMenu.addAction(self.runTestModel4MenuAct)
+        editMenu.addAction(self.runSTBMenuAct)
+
+        # Add View menu
+        self.viewMenu = self.menuBar().addMenu("View")
+        self.viewMenu.addAction(self.toggleImagePaneAct)
+        self.viewMenu.addSeparator()
+        self.draftViewCountAct = QAction("Draft View Count", self, triggered=self.draftViewCount)
+        self.viewMenu.addAction(self.draftViewCountAct)
+
+    def createToolBar(self):
+        # Create two toolbars
+        toolbar1 = QToolBar("Main Toolbar 1")
+        toolbar2 = QToolBar("Main Toolbar 2")
+
+        # Set toolbar icon and button sizes for both toolbars
+        for toolbar in [toolbar1, toolbar2]:
+            toolbar.setIconSize(QSize(64, 64))  # Double the default icon size (usually 32x32)
+            toolbar.setStyleSheet("""
+                QToolBar {
+                    spacing: 0px;
+                    padding: 0px;
+                }
+                QToolButton {
+                    font-size: 16pt;  /* Double the default font size */
+                    padding: 8px 4px;  /* Reduced horizontal padding */
+                    margin: 0px;      /* Remove margins */
+                    min-width: 100px; /* Reduced minimum width */
+                }
+            """)
+            toolbar.setMovable(False)  # Prevent moving the toolbar
+            toolbar.setFloatable(False)  # Prevent floating
+            toolbar.setOrientation(Qt.Horizontal)  # Force horizontal orientation
+
+        # Force toolbars to break into new lines
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.addToolBarBreak()
+
+        # First row: test models and timeSaver
+        toolbar1.addAction(self.newAct)
+        toolbar1.addAction(self.runTestModelToolbarAct)
+        toolbar1.addAction(self.runTestModelExperimentalToolbarAct)
+        toolbar1.addAction(self.runTestModel3ToolbarAct)
+        toolbar1.addAction(self.runTestModel4ToolbarAct)
+        toolbar1.addAction(self.runTimeSaverToolbarAct)
+        toolbar1.addAction(self.runIntroToolbarAct)
+        toolbar1.addAction(self.runOutroToolbarAct)
+        toolbar1.addAction(self.runGpsToolbarAct)  # Add GPS button
+        toolbar1.addAction(self.runDeepStateAct)  # Add DeepState button
+        toolbar1.addAction(self.runContextToolbarAct)  # Add Context button
+
+        # Add first toolbar and force a break
+        self.addToolBar(Qt.TopToolBarArea, toolbar1)
+        self.addToolBarBreak()
+
+        # Second row: remaining tools
+        toolbar2.addAction(self.runSegmentSorterToolbarAct)  # Moved to start of toolbar2
+        toolbar2.addAction(self.runQqToolbarAct)
+        toolbar2.addAction(self.runShrtnToolbarAct)
+        toolbar2.addAction(self.runSynToolbarAct)
+        toolbar2.addAction(self.runSTBToolbarAct)
+        toolbar2.addAction(self.runSTBCToolbarAct)  # Add STBC button right after STB
+        toolbar2.addAction(self.runGrammarToolbarAct)  # Add Grammar button
+        
+        # Add CmntSntmnt button to toolbar2
+        self.runCmntSntmntToolbarAct = QAction("CmntSntmnt", self)
+        self.runCmntSntmntToolbarAct.setToolTip("CmntSntmnt - Analyze sentiment of highlighted comments")
+        self.runCmntSntmntToolbarAct.triggered.connect(self.script_runner.runCmntSntmntScript)
+        toolbar2.addAction(self.runCmntSntmntToolbarAct)
+        logging.critical("Added CmntSntmnt button to toolbar2")
+
+        # Add second toolbar
+        self.addToolBar(Qt.TopToolBarArea, toolbar2)
+
+        # Set the toolbar area to use two rows
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        toolbar1.setAllowedAreas(Qt.TopToolBarArea)
+        toolbar2.setAllowedAreas(Qt.TopToolBarArea)
+
+        # Add Usage Check button for testing
+        usage_action = QAction("Usage Check", self)
+        usage_action.triggered.connect(self.run_usage_check)
+        toolbar2.addAction(usage_action)
+
+        # Add third toolbar (Main Toolbar 3)
+        self.addToolBarBreak()
+        toolbar3 = QToolBar("Main Toolbar 3")
+        toolbar3.setIconSize(QSize(64, 64))
+        toolbar3.setStyleSheet(toolbar1.styleSheet())
+        toolbar3.setMovable(False)
+        toolbar3.setFloatable(False)
+        toolbar3.setOrientation(Qt.Horizontal)
+        
+        # Add test button to toolbar3
+        test_action = QAction("TestBtn", self)
+        test_action.setToolTip("Test Button - Verify toolbar3 buttons work")
+        test_action.triggered.connect(self.testButtonClicked)
+        toolbar3.addAction(test_action)
+        logging.critical("Added test button to toolbar3")
+        
+        # Add Translate button to toolbar3
+        toolbar3.addAction(self.translateAct)
+
+        # Add Twitter button to Main Toolbar 3
+        twitter_action = QAction("Twitter", self)
+        twitter_action.setToolTip("Twitter - Convert highlighted word to Twitter search URL")
+        twitter_action.triggered.connect(self.convertToTwitterSearch)
+        toolbar3.addAction(twitter_action)
+        logging.critical("Added Twitter button to toolbar3")
+
+        # Add new button "Cleaner" to Main Toolbar 3 (no functionality yet)
+        cleaner_action = QAction("Cleaner", self)
+        cleaner_action.setToolTip("Removes 'cc-' lines and groups of 4 consecutive empty lines while creating a backup of your file.")
+        cleaner_action.triggered.connect(self.runCleaner)
+        toolbar3.addAction(cleaner_action)
+
+        # Add new button "fgps" to Main Toolbar 3 (empty button for now)
+        fgps_action = QAction("fgps", self)
+        fgps_action.setToolTip("fgps - GPS coordinate finder")
+        fgps_action.triggered.connect(self.findAndCopyGpsCoordinates)
+        toolbar3.addAction(fgps_action)
+        logging.critical("Added fgps button to toolbar3")
+
+        # Add new button "academic" to Main Toolbar 3 (no functionality yet)
+        academic_action = QAction("academic", self)
+        academic_action.setToolTip("academic - For academic text processing")
+        academic_action.triggered.connect(self.run_academic_check)
+        toolbar3.addAction(academic_action)
+        logging.critical("Added academic button to toolbar3")
+        
+        # Add TMaker button to Main Toolbar 3
+        toolbar3.addAction(self.tMakerAct)
+        logging.critical("Added TMaker button to toolbar3")
+
+        # Add Prnc toolbar action
+        toolbar3.addAction(self.runPrncToolbarAct)
+        logging.critical("Added Prnc button to toolbar3")
+
+        # Add ReFlow button to Main Toolbar 3
+        reflow_action = QAction("ReFlow", self)
+        reflow_action.setToolTip("ReFlow - Text Reflowing Tool")
+        reflow_action.triggered.connect(self.runReFlowScript)
+        toolbar3.addAction(reflow_action)
+        logging.critical("Added ReFlow button to toolbar3")
+
+        # Add LastWords button to Main Toolbar 3
+        lastwords_action = QAction("LastWords", self)
+        lastwords_action.setToolTip("LastWords - Complete the last sentence with 1-4 appropriate words")
+        lastwords_action.triggered.connect(self.runLastWordsScript)
+        toolbar3.addAction(lastwords_action)
+        logging.critical("Added LastWords button to toolbar3")
+
+        # Add SkepticalOutro button to Main Toolbar 3
+        skeptical_outro_action = QAction("SkepticalOutro", self)
+        skeptical_outro_action.setToolTip("SkepticalOutro - Add a skeptical perspective to the text")
+        skeptical_outro_action.triggered.connect(self.runSkepticalOutroScript)
+        toolbar3.addAction(skeptical_outro_action)
+        logging.critical("Added SkepticalOutro button to toolbar3")
+
+        self.addToolBar(Qt.TopToolBarArea, toolbar3)
+        
+        # Add fourth toolbar (Main Toolbar 4)
+        self.addToolBarBreak()
+        toolbar4 = QToolBar("Main Toolbar 4")
+        toolbar4.setIconSize(QSize(64, 64))
+        toolbar4.setStyleSheet(toolbar1.styleSheet())
+        toolbar4.setMovable(False)
+        toolbar4.setFloatable(False)
+        toolbar4.setOrientation(Qt.Horizontal)
+        
+        # Add LastWords59 button to Main Toolbar 4
+        lastwords59_action = QAction("LastWords59", self)
+        lastwords59_action.setToolTip("LastWords59 - Enhanced version of LastWords")
+        lastwords59_action.triggered.connect(self.runLastWords59Script)
+        toolbar4.addAction(lastwords59_action)
+        logging.critical("Added LastWords59 button to toolbar4")
+        
+        # Add DTMS button to Main Toolbar 4
+        dtms_action = QAction("DTMS", self)
+        dtms_action.setToolTip("DTMS - Data Text Management System")
+        dtms_action.triggered.connect(self.runDTMSScript)
+        toolbar4.addAction(dtms_action)
+        logging.critical("Added DTMS button to toolbar4")
+        
+        # Add GrammarX2 button to Main Toolbar 4
+        grammarx2_action = QAction("GrammarX2", self)
+        grammarx2_action.setToolTip("GrammarX2 - Advanced grammar checking and correction")
+        grammarx2_action.triggered.connect(self.runGrammarX2Script)
+        toolbar4.addAction(grammarx2_action)
+        logging.critical("Added GrammarX2 button to toolbar4")
+        
+        # Add STBC-Middle button to Main Toolbar 4
+        stbc_middle_action = QAction("STBC-Middle", self)
+        stbc_middle_action.setToolTip("STBC-Middle - Rewrite content with balanced middle perspective")
+        stbc_middle_action.triggered.connect(self.runSTBCMiddleScript)
+        toolbar4.addAction(stbc_middle_action)
+        logging.critical("Added STBC-Middle button to toolbar4")
+        
+        # Add TempMaxCleaner button to Main Toolbar 4
+        tempmaxcleaner_action = QAction("TempMaxCleaner", self)
+        tempmaxcleaner_action.setToolTip("TempMaxCleaner - Backup file, remove Timestamp:/cc-/--/http lines, replace 'Title: with +")
+        tempmaxcleaner_action.triggered.connect(self.runTempMaxCleaner)
+        toolbar4.addAction(tempmaxcleaner_action)
+        logging.critical("Added TempMaxCleaner button to toolbar4")
+        
+        # Add gps-C button to Main Toolbar 4
+        gpsc_action = QAction("gps-C", self)
+        gpsc_action.setToolTip("gps-C - Advanced GPS coordinate processing")
+        gpsc_action.triggered.connect(self.runGpsCScript)
+        toolbar4.addAction(gpsc_action)
+        logging.critical("Added gps-C button to toolbar4")
+        
+        self.addToolBar(Qt.TopToolBarArea, toolbar4)
+
+    def createCpyImagesButton(self):
+        icon_path = os.path.join(os.path.dirname(__file__), '..', 'resources', 'cpyimages_icon.png')
+        if os.path.exists(icon_path):
+            cpyimages_icon = QIcon(icon_path)
+            logging.debug(f"Using custom icon for cpyimagesv4 from {icon_path}")
+        else:
+            cpyimages_icon = QIcon.fromTheme("folder")
+            logging.warning(f"Icon file not found at {icon_path}. Using default icon.")
+
+        self.cpyImagesAction = QAction(cpyimages_icon, "cpyimages", self)
+        self.cpyImagesAction.setToolTip("cpyimagesv4 - Copy images from text")
+        self.cpyImagesAction.triggered.connect(self.runCpyImagesOnTab)
+        logging.debug("Connected cpyimagesv4 button to runCpyImagesOnTab")
+
+        menubar = self.menuBar()
+        spacer = QWidgetAction(self)
+        spacer_widget = QWidget()
+        spacer_layout = QHBoxLayout(spacer_widget)
+        spacer_layout.setContentsMargins(0,0,0,0)
+        spacer_layout.addStretch()
+        spacer.setDefaultWidget(spacer_widget)
+        menubar.addAction(spacer)
+
+        menubar.addAction(self.cpyImagesAction)
+        logging.debug("Restored cpyimagesv4 top button.")
+
+    def createC6SortButton(self):
+        icon_path = os.path.join(os.path.dirname(__file__), '..', 'resources', 'c6sortv2_icon.png')
+        if os.path.exists(icon_path):
+            c6sort_icon = QIcon(icon_path)
+            logging.debug(f"Using custom icon for c6sortv2 from {icon_path}")
+        else:
+            c6sort_icon = QIcon.fromTheme("folder")
+            logging.warning(f"Icon file not found at {icon_path}. Using default icon.")
+
+        self.c6sortAction = QAction(c6sort_icon, "", self)
+        self.c6sortAction.setToolTip("c6sortv2 - Sort and organize text")
+        self.c6sortAction.triggered.connect(self.runC6SortV2Script)
+
+        menubar = self.menuBar()
+        spacer = QWidgetAction(self)
+        spacer_widget = QWidget()
+        spacer_layout = QHBoxLayout(spacer_widget)
+        spacer_layout.setContentsMargins(0,0,0,0)
+        spacer_layout.addStretch()
+        spacer.setDefaultWidget(spacer_widget)
+        menubar.addAction(spacer)
+
+        menubar.addAction(self.c6sortAction)
+        logging.debug("Restored c6sortv2 top button.")
+
+    def createDoubleDashButton(self):
+        icon_path = os.path.join(os.path.dirname(__file__), '..', 'resources', 'double_dash_icon.png')
+        if os.path.exists(icon_path):
+            double_dash_icon = QIcon(icon_path)
+            logging.debug(f"Using custom icon for double-dash from {icon_path}")
+        else:
+            double_dash_icon = QIcon.fromTheme("folder")
+            logging.warning(f"Icon file not found at {icon_path}. Using default icon.")
+
+        self.doubleDashAction = QAction(double_dash_icon, "", self)
+        self.doubleDashAction.setToolTip("Double Dash - Add -- prefix to selected lines")
+        self.doubleDashAction.setShortcut("Alt+D")
+        self.doubleDashAction.triggered.connect(self.addDoubleDashToSelectedText)
+
+        # Add a single spacer for both buttons
+        menubar = self.menuBar()
+        spacer = QWidgetAction(self)
+        spacer_widget = QWidget()
+        spacer_layout = QHBoxLayout(spacer_widget)
+        spacer_layout.setContentsMargins(0,0,0,0)
+        spacer_layout.addStretch()
+        spacer.setDefaultWidget(spacer_widget)
+        menubar.addAction(spacer)
+
+        # Add both buttons next to each other
+        menubar.addAction(self.doubleDashAction)
+        logging.debug("Added double-dash top button.")
+
+    def createSegmentSorterButton(self):
+        icon_path = os.path.join(os.path.dirname(__file__), '..', 'resources', 'segment_sorter_icon.png')
+        if os.path.exists(icon_path):
+            segment_sorter_icon = QIcon(icon_path)
+            logging.debug(f"Using custom icon for segment sorter from {icon_path}")
+        else:
+            segment_sorter_icon = QIcon.fromTheme("format-justify-fill")
+            logging.warning(f"Icon file not found at {icon_path}. Using default icon.")
+
+        self.segmentSorterAction = QAction(segment_sorter_icon, "", self)
+        self.segmentSorterAction.setToolTip("Sort Segments - Run segment sorter on current file")
+        self.segmentSorterAction.triggered.connect(self.runSegmentSorter)
+
+        # Add the button right after the double dash button (no spacer needed)
+        menubar = self.menuBar()
+        menubar.addAction(self.segmentSorterAction)
+        logging.debug("Added segment sorter top button.")
+
+    def runSegmentSorter(self):
+        editor = self.currentEditor()
+        if not editor:
+            return
+
+        current_file = editor.property("filepath")
+        if not current_file:
+            QMessageBox.warning(self, "Warning", "Please save the file first.")
+            return
+
+        # Save the current cursor and scroll positions
+        cursor = editor.textCursor()
+        cursor_position = cursor.position()
+        scroll_value = editor.verticalScrollBar().value()
+
+        script_path = "/home/j/Desktop/code/gui71/segmentMoversAllv6.py"
+        if not os.path.exists(script_path):
+            QMessageBox.critical(self, "Error", f"Script not found at {script_path}")
+            return
+
+        try:
+            # Run the script using subprocess like other script methods
+            subprocess.run([sys.executable, script_path, current_file], check=True)
+            
+            # After running the script, read the file and process cc- lines
+            try:
+                with open(current_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    
+                # Split into lines and process
+                lines = content.splitlines()
+                new_lines = []
+                
+                in_segment = False
+                found_first_cc = False
+                
+                i = 0
+                while i < len(lines):
+                    line = lines[i].strip()
+                    
+                    # Check for new segment
+                    if line.startswith('"Title:') or line.startswith("'Title:"):
+                        # Add current line
+                        new_lines.append(lines[i])
+                        in_segment = True
+                        found_first_cc = False
+                    # Check for first cc- in segment
+                    elif in_segment and line.startswith('cc-') and not found_first_cc:
+                        # Add 4 empty lines before the first cc- line
+                        new_lines.extend([''] * 4)
+                        new_lines.append(lines[i])
+                        found_first_cc = True
+                    # Regular cc- line (not first in segment)
+                    elif line.startswith('cc-'):
+                        # Add empty line before if there isn't one already
+                        if new_lines and new_lines[-1].strip():
+                            new_lines.append('')
+                        # Add the cc- line
+                        new_lines.append(lines[i])
+                        # Add empty line after if next line isn't empty
+                        if i + 1 < len(lines) and lines[i + 1].strip():
+                            new_lines.append('')
+                    else:
+                        new_lines.append(lines[i])
+                    i += 1
+                
+                # Write back to file
+                with open(current_file, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(new_lines))
+                
+                # Update editor content
+                editor.setPlainText('\n'.join(new_lines))
+                
+                # Restore cursor position, making sure it's within the valid range
+                new_cursor = editor.textCursor()
+                new_position = min(cursor_position, len('\n'.join(new_lines)))
+                new_cursor.setPosition(new_position)
+                editor.setTextCursor(new_cursor)
+                
+                # Restore scroll position
+                editor.verticalScrollBar().setValue(scroll_value)
+                
+                self.statusBar().showMessage("Segment sorter completed successfully.", 5000)
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to process cc- lines: {str(e)}")
+                
+        except subprocess.CalledProcessError as e:
+            QMessageBox.critical(self, "Error", f"Failed to run segment sorter: {str(e)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to run segment sorter: {str(e)}")
+
+    def addDoubleDashToSelectedText(self):
+        editor = self.currentEditor()
+        if not editor:
+            self.statusBar().showMessage("No open editor for double-dash action.", 5000)
+            logging.warning("Attempted to add double dash with no open editor.")
+            return
+
+        cursor = editor.textCursor()
+        if cursor.hasSelection():
+            selected_text = cursor.selectedText()
+            if not selected_text.strip():
+                self.statusBar().showMessage("No text found to add double dashes.", 5000)
+                logging.warning("No text found for double dash operation.")
+                return
+
+            # Convert Qt's paragraph separators to newlines
+            temp = selected_text.replace('\u2029', '\n')
+            lines = temp.split('\n')
+            processed_lines = []
+            for line in lines:
+                if line.strip():
+                    processed_lines.append(f"--{line}")
+                else:
+                    processed_lines.append(line)
+            new_text = "\n".join(processed_lines)
+
+            cursor.beginEditBlock()
+            cursor.removeSelectedText()
+            cursor.insertText(new_text)
+            cursor.endEditBlock()
+
+            self.statusBar().showMessage("Added `--` to selected lines.", 5000)
+            logging.info("Double dash operation completed on selected lines.")
+        else:
+            # No selection: operate on the current block or contiguous media block
+            current_index = cursor.blockNumber()
+            block = editor.document().findBlockByNumber(current_index)
+            block_text = block.text()
+            import re
+            media_regex = re.compile(r'^\s*[/\\].*\.(png|jpg|jpeg|gif|bmp|webp)$', re.IGNORECASE)
+
+            if media_regex.match(block_text.strip()):
+                # Determine contiguous media file blocks
+                start_line = current_index
+                end_line = current_index
+                while start_line > 0 and media_regex.match(editor.document().findBlockByNumber(start_line - 1).text().strip()):
+                    start_line -= 1
+                while end_line < editor.document().blockCount() - 1 and media_regex.match(editor.document().findBlockByNumber(end_line + 1).text().strip()):
+                    end_line += 1
+                # Select the blocks from start_line to end_line
+                block_start = editor.document().findBlockByNumber(start_line)
+                block_end = editor.document().findBlockByNumber(end_line)
+                selection_cursor = editor.textCursor()
+                selection_cursor.setPosition(block_start.position())
+                selection_cursor.setPosition(block_end.position() + block_end.length(), QTextCursor.KeepAnchor)
+
+                # Save current absolute cursor position
+                old_position = cursor.position()
+                text_to_update = selection_cursor.selectedText().replace('\u2029', '\n')
+                lines = text_to_update.split('\n')
+                new_lines = []
+                for line in lines:
+                    if line.strip() and not line.lstrip().startswith("--"):
+                        leading = line[:len(line) - len(line.lstrip())]
+                        new_lines.append(leading + "--" + line.lstrip())
+                    else:
+                        new_lines.append(line)
+                new_text = "\n".join(new_lines)
+
+                selection_cursor.beginEditBlock()
+                selection_cursor.removeSelectedText()
+                selection_cursor.insertText(new_text)
+                selection_cursor.endEditBlock()
+
+                # Adjust cursor: if the current block was modified, add 2 characters offset
+                cursor.setPosition(old_position + 2)
+                self.statusBar().showMessage("Added `--` to media file path lines.", 5000)
+                logging.info("Double dash operation completed on media file path group.")
+            else:
+                # Update only the current block
+                if not block_text.lstrip().startswith("--"):
+                    old_position = cursor.position()
+                    selection_cursor = editor.textCursor()
+                    selection_cursor.select(QTextCursor.BlockUnderCursor)
+                    leading = block_text[:len(block_text) - len(block_text.lstrip())]
+                    new_line = leading + "--" + block_text.lstrip()
+                    selection_cursor.beginEditBlock()
+                    selection_cursor.removeSelectedText()
+                    selection_cursor.insertText(new_line)
+                    selection_cursor.endEditBlock()
+
+                    # Adjust cursor position: if cursor was within this block, add 2
+                    cursor.setPosition(old_position + 2)
+                    self.statusBar().showMessage("Added `--` to current line.", 5000)
+                    logging.info("Double dash operation completed on current line.")
+                else:
+                    self.statusBar().showMessage("Current line already has `--`.", 5000)
+        return
+
+    # Script Runner Hooks
+    def runTimeSaverScript(self):
+        self.script_runner.run_timeSaverScript()
+
+    def runIntroScript(self):
+        import os, subprocess
+        from PyQt5.QtWidgets import QMessageBox
+
+        # Build the path to intro.py assuming it's in the scripts folder at the project root
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script_path = os.path.join(project_root, "scripts", "intro.py")
+
+        if not os.path.exists(script_path):
+            QMessageBox.critical(self, "Error", f"Intro script not found at {script_path}")
+            return
+
+        # Get the current editor and selected text
+        editor = self.currentEditor()
+        if not editor:
+            self.statusBar().showMessage("No open editor for intro.", 5000)
+            return
+        
+        selected_text = editor.textCursor().selectedText()
+        if not selected_text.strip():
+            self.statusBar().showMessage("No text selected for intro.", 5000)
+            return
+
+        try:
+            # Pass the selected text as an argument to the intro script
+            # and capture its output
+            result = subprocess.run(
+                [sys.executable, script_path, selected_text],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            # Replace the selected text with the script output
+            cursor = editor.textCursor()
+            cursor.beginEditBlock()
+            cursor.removeSelectedText()
+            cursor.insertText(result.stdout)
+            cursor.endEditBlock()
+
+            self.statusBar().showMessage("Intro script completed successfully.", 5000)
+            import logging
+            logging.info("Intro script executed successfully.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to run intro script: {e}")
+
+    def runOutroScript(self):
+        self.script_runner.runOutroScript()
+
+    def runTs1Script(self):
+        self.script_runner.runTs1Script()
+
+    def runQqScript(self):
+        self.script_runner.runQqScript()
+
+    def runShrtnScript(self):
+        self.script_runner.runShrtnScript()
+
+    # NEW: syn
+    def runSynScript(self):
+        self.script_runner.runSynScript()
+
+    def runCpyImagesOnTab(self):
+        """
+        Wrapper method to call the ScriptRunner's cpyimages script
+        """
+        print("DEBUG: runCpyImagesOnTab called")  # Debug print
+        logging.debug("CpyImages button clicked, calling script_runner")
+        self.statusBar().showMessage("Running CpyImages script...")
+        self.script_runner.run_cpyimagesv4_on_tab()
+
+    def runC6SortV2Script(self):
+        self.script_runner.run_c6sortv2_script_on_tab()
+        editor = self.currentEditor()
+        if editor:
+            filepath = editor.property("filepath")
+            if filepath and os.path.exists(filepath):
+                new_mtime = os.path.getmtime(filepath)
+                editor.setProperty("last_modified_time", new_mtime)
+        # Clear any external change warning if it was set
+        self.statusBar().setStyleSheet("")
+        self.statusBar().clearMessage()
+
+    # Tab management
+    def newTab(self):
+        editor = Editor(parent=self)
+        index = self.tabs.addTab(editor, "Untitled")
+        self.tabs.setCurrentIndex(index)
+        editor.setFocus()
+        # Connect text change signal to update title segments
+        editor.textChanged.connect(self.updateTitleSegments)
+        editor.document().contentsChanged.connect(lambda: self.markUnsavedChanges(editor))
+        editor.verticalScrollBar().valueChanged.connect(self.syncImageScroll)
+        # Add scroll event connection for title highlighting
+        editor.verticalScrollBar().valueChanged.connect(self.updateTitleSegments)
+        
+        # Update title segments immediately
+        self.updateTitleSegments()
+        return editor
+
+    def dragEnterEvent(self, event):
+        # Accept drag event if it contains URLs with supported file extensions
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    file_path = url.toLocalFile()
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if ext in ['.txt', '.py', '.vhd']:
+                        event.acceptProposedAction()
+                        return
+        event.ignore()
+
+    def dropEvent(self, event):
+        # Open each dropped file with supported extension in a new tab
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    file_path = url.toLocalFile()
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if ext in ['.txt', '.py', '.vhd'] and os.path.exists(file_path):
+                        self.openFile(file_path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def closeTab(self, index):
+        widget = self.tabs.widget(index)
+        if widget is not None:
+            if not self.maybeSave(widget):
+                logging.info(f"Cancelled closing tab at index {index} due to unsaved changes.")
+                return
+        
+            # Remove any title segment buttons for this tab
+            self.updateTitleSegments()
+        
+            self.tabs.removeTab(index)
+            widget.deleteLater()
+            logging.info(f"Closed tab at index {index}.")
+        if self.tabs.count() == 0:
+            self.newTab()
+
+    def closeCurrentTab(self):
+        """
+        Close the currently active tab.
+        """
+        current_index = self.tabs.currentIndex()
+        if current_index >= 0:
+            self.closeTab(current_index)
+
+    def currentEditor(self):
+        """
+        Returns the currently active Editor instance.
+        """
+        return self.tabs.currentWidget()
+
+    # File Operations
+    def openDialog(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Open File")
+        if fname:
+            self.openFile(fname)
+
+    def openFile(self, fname, cursor_pos=0, scroll_pos=0):
+        if not os.path.exists(fname):
+            QMessageBox.warning(self, "Error", f"File does not exist: {fname}")
+            logging.warning(f"Attempted to open non-existent file: {fname}")
+            return
+        try:
+            with open(fname, 'r', encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except Exception as e:
+            QMessageBox.information(self, "Unsupported", f"Failed to open file: {e}")
+            logging.error(f"Failed to open file {fname}: {e}")
+            return
+
+        editor = Editor(parent=self)
+        editor.setPlainText(text)
+        editor.setProperty("filepath", fname)
+        editor.setProperty("last_modified_time", os.path.getmtime(fname))
+        editor.document().contentsChanged.connect(lambda: self.markUnsavedChanges(editor))
+        editor.textChanged.connect(self.updateTitleSegments)
+        editor.verticalScrollBar().valueChanged.connect(self.syncImageScroll)
+        # Add scroll event connection for title highlighting
+        editor.verticalScrollBar().valueChanged.connect(self.updateTitleSegments)
+        
+        # Set cursor and scroll position
+        cursor = editor.textCursor()
+        cursor.setPosition(cursor_pos)
+        editor.setTextCursor(cursor)
+        editor.verticalScrollBar().setValue(scroll_pos)
+        
+        self.tabs.addTab(editor, os.path.basename(fname))
+        self.tabs.setCurrentWidget(editor)
+        self.statusBar().showMessage(f"Opened file: {fname}", 5000)
+        logging.info(f"Opened file: {fname} at position {cursor_pos}")
+
+        if hasattr(self, 'recent_files'):
+            self.recent_files.add_file(fname)
+            
+        # Update title segments immediately after opening
+        self.updateTitleSegments()
+
+        if fname:
+            self.current_file = fname
+            self.last_modified_time = os.path.getmtime(fname)
+
+    def saveFile(self):
+        editor = self.currentEditor()
+        if not editor:
+            logging.warning("Save action triggered with no open editor.")
+            return False
+        filepath = editor.property("filepath")
+        if filepath:
+            # Check if the save operation succeeded
+            if self.doSave(editor, filepath):
+                # Update properties after successful save
+                try:
+                    editor.setProperty("last_modified_time", os.path.getmtime(filepath))
+                except OSError as e:
+                    logging.error(f"Could not get mtime for {filepath}: {e}")
+                    editor.setProperty("last_modified_time", None) # Reset if error
+                editor.document().setModified(False) # Mark as saved
+                self.updateTabTitle(editor, saved=True) # Update title to remove asterisk
+                # Add to recent files (doSave doesn't handle this)
+                if hasattr(self, 'recent_files'):
+                    self.recent_files.add_file(filepath)
+                # Clear external change warning from status bar is handled in doSave
+                return True
+            else:
+                # doSave failed (error message shown in doSave)
+                return False
+        else:
+            # If no filepath exists, call saveFileAs (which handles untitled files)
+            # Corrected call: saveFileAs() doesn't take arguments anymore.
+            return self.saveFileAs()
+
+    def saveFileAs(self):
+        logging.debug('saveFileAs triggered via shortcut or menu')
+        editor = self.currentEditor() # Directly get the current editor
+
+        if not editor:
+            logging.warning('No editor is active for Save As.')
+            QMessageBox.warning(self, "Save As", "No file is active. Please open a file or create a new tab first.")
+            return False
+
+        # Suggest a filename based on the current file if it exists
+        current_filepath = editor.property("filepath")
+        initial_dir = os.path.dirname(current_filepath) if current_filepath else ""
+        initial_name = os.path.basename(current_filepath) if current_filepath else "Untitled.txt"
+
+        # Use QFileDialog to get the new filename
+        fname, _ = QFileDialog.getSaveFileName(self,
+                                             "Save File As",
+                                             os.path.join(initial_dir, initial_name), # Suggest current path/name
+                                             "Text Files (*.txt);;All Files (*)")
+
+        if fname:
+            # Call doSave with the obtained editor and new filename
+            if self.doSave(editor, fname): # Check if doSave succeeded
+                # Update the tab title and properties for the saved file
+                index = self.tabs.indexOf(editor)
+                if index != -1:
+                    self.tabs.setTabText(index, os.path.basename(fname))
+                editor.setProperty("filepath", fname)
+                # Update last modified time *after* successful save
+                try:
+                    editor.setProperty("last_modified_time", os.path.getmtime(fname))
+                except OSError as e:
+                    logging.error(f"Could not get mtime for {fname}: {e}")
+                    editor.setProperty("last_modified_time", None) # Reset if error
+
+                editor.document().setModified(False) # Mark as saved
+                # self.updateTabTitle(editor, saved=True) # Already done by setTabText and setModified above
+                if hasattr(self, 'recent_files'):
+                    self.recent_files.add_file(fname) # Add to recent files
+                return True
+            else:
+                # doSave failed (e.g., permissions error shown in doSave)
+                return False
+        else:
+            # User cancelled the dialog
+            logging.debug("Save As cancelled by user.")
+            return False
+
+    def doSave(self, editor, filepath):
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(editor.toPlainText())
+            # Properties (filepath, modified status, etc.) are updated by the caller (saveFile/saveFileAs)
+            self.statusBar().showMessage(f"File saved: {filepath}", 5000)
+            logging.info(f"File saved: {filepath}")
+            # Clear potential external change warning after successful save
+            self.statusBar().setStyleSheet("")
+            return True # Indicate success
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to save file: {e}")
+            logging.error(f"Failed to save file {filepath}: {e}")
+            return False # Indicate failure
+
+    def maybeSave(self, editor):
+        if editor.document().isModified():
+            ret = QMessageBox.warning(self, "Application",
+                "The document has been modified.\n"
+                "Do you want to save your changes?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            if ret == QMessageBox.Yes:
+                return self.saveFileAs(editor)
+            elif ret == QMessageBox.No:
+                return True
+            elif ret == QMessageBox.Cancel:
+                return False
+        return True
+
+    def markUnsavedChanges(self, editor):
+        index = self.tabs.indexOf(editor)
+        if index != -1:
+            tab_title = self.tabs.tabText(index)
+            if editor.document().isModified() and not tab_title.endswith("*"):
+                self.tabs.setTabText(index, tab_title + " *")
+                logging.debug(f"Marked tab '{tab_title}' as unsaved.")
+            elif not editor.document().isModified() and tab_title.endswith(" *"):
+                self.tabs.setTabText(index, tab_title.rstrip(" *"))
+                logging.debug(f"Removed unsaved mark from tab '{tab_title}'.")
+
+    def updateTabTitle(self, editor, saved=False):
+        index = self.tabs.indexOf(editor)
+        if index != -1:
+            filepath = editor.property("filepath")
+            if filepath:
+                filename = os.path.basename(filepath)
+            else:
+                filename = "Untitled"
+            if saved:
+                self.tabs.setTabText(index, filename)
+                logging.debug(f"Updated tab title to '{filename}'.")
+            else:
+                self.tabs.setTabText(index, filename + " *")
+                logging.debug(f"Marked tab '{filename}' as unsaved.")
+
+    def cutText(self):
+        editor = self.currentEditor()
+        if editor:
+            editor.cut()
+            logging.debug("Cut text.")
+
+    def copyText(self):
+        editor = self.currentEditor()
+        if editor:
+            editor.copy()
+            logging.debug("Copied text.")
+
+    def pasteText(self):
+        editor = self.currentEditor()
+        if editor:
+            editor.paste()
+            logging.debug("Pasted text.")
+
+    def openFindDialog(self):
+        editor = self.currentEditor()
+        if not editor:
+            QMessageBox.warning(self, "No Editor", "There is no open file to find text.")
+            logging.warning("Attempted to open Find Dialog with no open editor.")
+            return
+        
+        self.find_dialog = FindDialog(editor, self)
+        self.find_dialog.show()
+        logging.info("Opened Find Dialog.")
+
+    def closeEvent(self, event):
+        for i in range(self.tabs.count()):
+            editor = self.tabs.widget(i)
+            if not self.maybeSave(editor):
+                event.ignore()
+                logging.info("Application close canceled by user.")
+                return
+        
+        # Save the current file path before closing
+        current_editor = self.currentEditor()
+        if current_editor:
+            filepath = current_editor.property("filepath")
+            if filepath:
+                self.save_last_file(filepath)
+        
+        event.accept()
+        logging.info("Application closed successfully.")
+
+    def save_last_file(self, filepath):
+        """Save the last opened file path and cursor position to config"""
+        try:
+            os.makedirs(self.config_dir, exist_ok=True)
+            current_editor = self.currentEditor()
+            cursor = current_editor.textCursor()
+            scroll_value = current_editor.verticalScrollBar().value()
+            
+            config = {
+                'filepath': filepath,
+                'cursor_position': cursor.position(),
+                'scroll_position': scroll_value
+            }
+            
+            with open(self.config_file, 'w') as f:
+                f.write(f"{filepath}\n{cursor.position()}\n{scroll_value}")
+            logging.debug(f"Saved last file location and position: {filepath}, cursor: {cursor.position()}, scroll: {scroll_value}")
+        except Exception as e:
+            logging.error(f"Failed to save last file location and position: {e}")
+
+    def load_last_file(self):
+        """Load the last opened file path and cursor position from config"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    lines = f.readlines()
+                    if len(lines) >= 3:
+                        filepath = lines[0].strip()
+                        cursor_pos = int(lines[1].strip())
+                        scroll_pos = int(lines[2].strip())
+                        return filepath, cursor_pos, scroll_pos
+                    elif len(lines) >= 1:
+                        return lines[0].strip(), 0, 0
+        except Exception as e:
+            logging.error(f"Failed to load last file location and position: {e}")
+        return None, 0, 0
+
+    def handleQQAction(self):
+        """
+        Handles the QQ button click event.
+        Uses the script runner to process the text.
+        """
+        self.script_runner.runQqScript()
+
+    def getSelectedText(self):
+        """
+        Retrieves the currently selected text from the editor.
+        """
+        editor = self.currentEditor()
+        if not editor:
+            return ""
+        cursor = editor.textCursor()
+        return cursor.selectedText()
+
+    def showResponse(self, response):
+        """
+        Displays the API response to the user.
+        """
+        if response:
+            # Assuming the response has a 'message' field
+            message = response.get("message", "No message returned.")
+            QMessageBox.information(self, "API Response", message)
+        else:
+            QMessageBox.warning(self, "No Response", "No response received from the API.")
+
+    def sendToAPI(self, text):
+        """
+        Sends the provided text to the external API and returns the response.
+        """
+        api_url = "https://api.example.com/your-endpoint"  # Replace with your API endpoint
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer YOUR_API_TOKEN"  # Replace with your API token if needed
+        }
+        payload = {
+            "data": text
+        }
+
+        try:
+            response = requests.post(api_url, json=payload, headers=headers)
+            response.raise_for_status()
+            logging.debug("API request successful.")
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"API request failed: {e}")
+            QMessageBox.critical(self, "API Error", f"Failed to send data to API:\n{e}")
+            return None
+
+    def getCurrentFilePath(self):
+        """Returns the path of the currently active file."""
+        editor = self.currentEditor()
+        if editor:
+            return editor.property("filepath")
+        return None
+
+    def build_file_index(self):
+        """Build an index of all files in search directories for faster lookup"""
+        self.file_index = {}
+        for dir_path in self.search_dirs:
+            if os.path.exists(dir_path):
+                for root, _, files in os.walk(dir_path):
+                    for name in files:
+                        self.file_index[name] = os.path.join(root, name)
+        logging.info("File index built for image searching")
+
+    def find_image_path(self, path_or_filename):
+        """Find the full path of an image using the same logic as cpyimagesv4.py"""
+        logging.debug(f"Searching for image: {path_or_filename}")
+        # Decode URL-encoded characters
+        path_or_filename = urllib.parse.unquote(path_or_filename.strip())
+        
+        # Remove leading dashes
+        path_or_filename = path_or_filename.lstrip('-')
+
+        # Handle paths starting with 'file://'
+        if path_or_filename.startswith('file://'):
+            path_or_filename = path_or_filename[7:]
+
+        # If it's an absolute path and exists, return it
+        if os.path.isabs(path_or_filename) and os.path.isfile(path_or_filename):
+            logging.debug(f"Found absolute path: {path_or_filename}")
+            return path_or_filename
+            
+        # Check destination directory first (temp_pics)
+        dest_path = os.path.join(self.destination_dir, path_or_filename)
+        if os.path.isfile(dest_path):
+            logging.debug(f"Found in destination directory: {dest_path}")
+            return dest_path
+            
+        # Look in the file index
+        basename = os.path.basename(path_or_filename)
+        if basename in self.file_index:
+            logging.debug(f"Found in file index: {self.file_index[basename]}")
+            return self.file_index[basename]
+
+        # Search in specified directories
+        for dir_path in self.search_dirs:
+            potential_path = os.path.join(dir_path, basename)
+            logging.debug(f"Checking: {potential_path}")
+            if os.path.isfile(potential_path):
+                logging.debug(f"Found in search directory: {potential_path}")
+                return potential_path
+            
+        logging.warning(f"Image not found: {path_or_filename}")
+        return None
+
+    def updateImageDisplay(self):
+        """Schedule a debounced update of the image display"""
+        if not self.image_pane_visible:
+            return
+        self._image_update_timer.start(self._image_update_delay)
+
+    def _debounced_update_images(self):
+        """Actually perform the image update after the debounce delay"""
+        if not self.image_pane_visible:
+            return
+            
+        # Clear existing images and line number mapping
+        while self.image_layout.count():
+            item = self.image_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.image_line_numbers.clear()
+        
+        # Get text from current editor
+        current_editor = self.currentEditor()
+        if not current_editor:
+            return
+            
+        text = current_editor.toPlainText()
+        lines = text.split('\n')
+        
+        # Get the visible lines range
+        first_block = current_editor.firstVisibleBlock()
+        first_line = first_block.blockNumber()
+        
+        viewport_height = current_editor.viewport().height()
+        last_block = current_editor.cursorForPosition(QPoint(0, viewport_height)).block()
+        last_line = last_block.blockNumber()
+
+        # Structure to hold segments and their images
+        segments = []  # List of (title, start_line, end_line, images) tuples
+        current_segment = None
+        current_images = []
+        
+        # Import the word image module for creating word images
+        sys.path.insert(0, os.path.join(project_root, 'scripts'))
+        from word_image import create_word_image
+        
+        # Process lines to identify segments and their images
+        for line_num, line in enumerate(lines):
+            line = line.strip()
+            
+            # Skip empty lines
+            if not line:
+                continue
+
+            # Check for word image lines (starting with ----)
+            if line.startswith('----'):
+                word_text = line[4:].strip()  # Extract text after the dashes
+                if word_text and current_segment:  # Only process if there's text and we're in a segment
+                    try:
+                        # Create word image
+                        image_path = create_word_image(word_text, self.word_images_dir)
+                        # Add to current segment's images
+                        current_images.append((image_path, line_num, True))
+                    except Exception as e:
+                        logging.error(f"Error creating word image for '{word_text}': {e}")
+                continue
+
+            # Check for new segment
+            if line.startswith('"Title:'):
+                # If we have a previous segment, save it
+                if current_segment:
+                    segments.append((current_segment[0], current_segment[1], line_num - 1, current_images))
+                
+                # Start new segment
+                title = line.strip('"').split(':', 1)[-1].strip()
+                current_segment = (title, line_num)
+                current_images = []
+                
+                # Add BSQ image if exists
+                specific_image = os.path.join(self.bsqs_dir, f"{title}.png")
+                if os.path.isfile(specific_image):
+                    current_images.append((specific_image, line_num, True))
+                elif not current_images:  # Only add generic if no specific BSQ
+                    current_images.append((self.generic_bsq, line_num, False))
+                
+            # Check for image lines
+            elif line.startswith('--'):
+                if line.strip().startswith('--http'):
+                    continue
+                    
+                file_path = line.lstrip('-').strip()
+                full_path = self.find_image_path(file_path)
+                
+                if full_path and os.path.isfile(full_path):
+                    current_images.append((full_path, line_num, True))
+                    
+        # Add the last segment if exists
+        if current_segment:
+            segments.append((current_segment[0], current_segment[1], len(lines) - 1, current_images))
+
+        # Find the current visible segment
+        visible_segments = []
+        
+        # Find all segments that are visible in the viewport
+        for i, (title, start_line, end_line, images) in enumerate(segments):
+            # Check if the title line is visible
+            title_visible = (start_line <= last_line and start_line >= first_line)
+            
+            # Calculate how many lines of this segment are visible
+            segment_start = max(first_line, start_line)
+            segment_end = min(last_line, end_line)
+            visible_lines = segment_end - segment_start + 1
+            
+            # Show segment if:
+            # 1. Title is visible, OR
+            # 2. More than 10 lines are visible AND title is NOT visible
+            if title_visible or (visible_lines > 10 and not title_visible):
+                visible_segments.append((title, start_line, end_line, images))
+                # Also include the next segment if it exists and starts within the viewport
+                if i < len(segments) - 1:
+                    next_segment = segments[i + 1]
+                    if next_segment[1] <= last_line:
+                        visible_segments.append(next_segment)
+                        break  # Only show one next segment
+
+        # Display images for visible segments
+        current_row = 0
+        
+        # Display regular segment images with word images integrated
+        if visible_segments:
+            for title, start_line, end_line, images in visible_segments:
+                # Add segment title
+                title_label = QLabel(f"Section: {title}")
+                title_label.setStyleSheet("color: white; font-size: 12px; font-weight: bold; background-color: rgba(60, 60, 60, 100); padding: 5px;")
+                title_label.setAlignment(Qt.AlignCenter)
+                self.image_layout.addWidget(title_label, current_row, 0, 1, 2)  # Span both columns
+                current_row += 1
+
+                # Add images for this segment in 2 columns
+                for i, (image_path, line_num, is_specific) in enumerate(images):
+                    container = self.add_image_to_display(image_path, line_num)
+                    if container:
+                        row = current_row + (i // 2)  # Integer division to determine row
+                        col = i % 2   # Modulo to determine column (0 or 1)
+                        self.image_layout.addWidget(container, row, col)
+                        self.image_line_numbers[line_num] = container
+                        
+                current_row += ((len(images) + 1) // 2) + 1  # Move to next row after segment's images
+            
+        # Add a spacer item at the bottom to keep images at the top
+        self.image_layout.setRowStretch(current_row, 1)
+
+    def add_image_to_display(self, file_path, line_num):
+        """Create a display widget for an image or media file"""
+        logging.debug(f"Adding image to display: {file_path}")
+        # Check if it's a media file
+        ext = os.path.splitext(file_path)[1].lower()
+        is_video = ext in self.media_extensions['video']
+        is_audio = ext in self.media_extensions['audio']
+        
+        if is_video or is_audio:
+            # Create a clickable media thumbnail
+            container = self.create_media_thumbnail(file_path, is_video)
+        else:
+            # Create an image display
+            container = self.create_image_display(file_path)
+            
+        if container:
+            logging.debug(f"Image added to layout for line: {line_num}")
+            container.setProperty("media_line", line_num)
+            container.setProperty("file_path", file_path) # Store the file path here
+            container.setContextMenuPolicy(Qt.CustomContextMenu)
+            container.customContextMenuRequested.connect(lambda pos, w=container: self.showMediaContextMenu(w, pos))
+        else:
+            logging.warning(f"Failed to create display for image: {file_path}")
+        return container
+
+    def create_media_thumbnail(self, file_path, is_video):
+        """Create a clickable thumbnail for media files"""
+        container = QWidget()
+        container.setStyleSheet("background-color: rgba(40, 40, 40, 50);")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(5)  # Reduce spacing between elements
+
+        # Create clickable label with icon or thumbnail
+        thumbnail = QPushButton()
+        thumbnail.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 30);
+            }
+        """)
+        
+        # Set icon based on media type
+        icon_size = QSize(108, 72)  # Default size
+        if is_video:
+            # Try to generate video thumbnail
+            thumbnail_path = self.generate_video_thumbnail(file_path)
+            if thumbnail_path:
+                # Load and scale the thumbnail
+                pixmap = QPixmap(thumbnail_path)
+                if not pixmap.isNull():
+                    scaled_pixmap = pixmap.scaledToWidth(108, Qt.SmoothTransformation)
+                    thumbnail.setIcon(QIcon(scaled_pixmap))
+                    thumbnail.setIconSize(scaled_pixmap.size())
+                else:
+                    # Fallback to generic icon if thumbnail generation failed
+                    icon = QIcon.fromTheme("video-x-generic")
+                    thumbnail.setIcon(icon)
+                    thumbnail.setIconSize(icon_size)
+            else:
+                # Fallback to generic icon if thumbnail generation failed
+                icon = QIcon.fromTheme("video-x-generic")
+                thumbnail.setIcon(icon)
+                thumbnail.setIconSize(icon_size)
+        else:
+            icon = QIcon.fromTheme("audio-x-generic")
+            thumbnail.setIcon(icon)
+            thumbnail.setIconSize(icon_size)
+        
+        # Create play button overlay
+        play_icon = QIcon.fromTheme("media-playback-start")
+        play_button = QPushButton()
+        play_button.setIcon(play_icon)
+        play_button.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 0, 0, 100);
+                border-radius: 25px;
+                padding: 10px;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 0, 0, 150);
+            }
+        """)
+        play_button.setFixedSize(50, 50)
+        
+        # Create a widget to center the play button over the thumbnail
+        overlay_container = QWidget()
+        overlay_layout = QVBoxLayout(overlay_container)
+        overlay_layout.addWidget(play_button, alignment=Qt.AlignCenter)
+        
+        # Add click handlers
+        file_path_copy = file_path  # Create a copy for the lambda
+        thumbnail.clicked.connect(lambda: self.open_media_file(file_path_copy))
+        play_button.clicked.connect(lambda: self.open_media_file(file_path_copy))
+        
+        # Add filename label with truncated path
+        filename = os.path.basename(file_path)
+        dirname = os.path.dirname(file_path)
+        
+        # Truncate the directory path to show only the last two directories
+        path_parts = dirname.split(os.sep)
+        if len(path_parts) > 2:
+            short_path = os.path.join('...', *path_parts[-2:])
+        else:
+            short_path = dirname
+            
+        name_label = QLabel(filename)
+        name_label.setAlignment(Qt.AlignCenter)
+        name_label.setStyleSheet("color: gray; font-size: 9px;")
+        name_label.setWordWrap(True)
+        name_label.setMaximumWidth(150)  # Limit maximum width
+        
+        path_label = QLabel(short_path)
+        path_label.setAlignment(Qt.AlignCenter)
+        path_label.setStyleSheet("color: gray; font-size: 8px;")
+        path_label.setWordWrap(True)
+        path_label.setMaximumWidth(150)  # Limit maximum width
+        
+        # Add widgets to layout
+        layout.addWidget(thumbnail)
+        layout.addWidget(overlay_container)
+        layout.addWidget(name_label)
+        layout.addWidget(path_label)
+        
+        return container
+
+    def create_image_display(self, image_path):
+        """Create an image display widget"""
+        # Create a container for the image and its name
+        container = QWidget()
+        container.setStyleSheet("""
+            QWidget {
+                background-color: rgba(40, 40, 40, 50);
+            }
+            QPushButton {
+                background-color: transparent;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 30);
+            }
+        """)
+        
+        # Create a clickable button for the image
+        image_button = QPushButton()
+        image_button.setCursor(Qt.PointingHandCursor)
+        
+        # Load and scale the image
+        pixmap = QPixmap(image_path)
+        if not pixmap.isNull():
+            # Scale the image to fit the width while maintaining aspect ratio
+            scaled_pixmap = pixmap.scaledToWidth(108, Qt.SmoothTransformation)
+            image_button.setIcon(QIcon(scaled_pixmap))
+            image_button.setIconSize(scaled_pixmap.size())
+            
+            # Connect click handler
+            image_button.clicked.connect(lambda: self.open_media_file(image_path))
+            
+            # Show full filename
+            filename = os.path.basename(image_path)
+            
+            name_label = QLabel(filename)
+            name_label.setAlignment(Qt.AlignCenter)
+            name_label.setStyleSheet("color: #E0E0E0; font-size: 10px;")
+            name_label.setWordWrap(True)  # Enable word wrapping
+            name_label.setFixedWidth(108)  # Match width with the image
+            name_label.setMinimumHeight(50)  # Allow for up to 4 lines of text
+            
+            # Create layout for the container
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(10, 10, 10, 10)
+            container_layout.setSpacing(5)
+            container_layout.addWidget(image_button)
+            container_layout.addWidget(name_label)
+            
+            return container
+            
+        return None
+
+    def generate_video_thumbnail(self, video_path):
+        """Generate a thumbnail for a video file using ffmpeg"""
+        try:
+            # Create thumbnails directory if it doesn't exist
+            thumbnails_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'thumbnails')
+            os.makedirs(thumbnails_dir, exist_ok=True)
+            
+            # Generate unique thumbnail filename based on video path
+            thumbnail_name = f"{os.path.splitext(os.path.basename(video_path))[0]}.jpg"
+            thumbnail_path = os.path.join(thumbnails_dir, thumbnail_name)
+            
+            # Only generate thumbnail if it doesn't exist
+            if not os.path.exists(thumbnail_path):
+                # Use ffmpeg to extract a frame from 1 second into the video
+                cmd = f'ffmpeg -y -i "{video_path}" -ss 00:00:01.000 -vframes 1 "{thumbnail_path}"'
+                os.system(cmd)
+            
+            return thumbnail_path if os.path.exists(thumbnail_path) else None
+            
+        except Exception as e:
+            logging.error(f"Failed to generate video thumbnail: {e}")
+            return None
+
+    def open_media_file(self, file_path):
+        """Open a media file with the system's default application"""
+        import subprocess
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in ['.png', '.webp']:
+                # Open PNG and WEBP files with eog
+                subprocess.Popen(['eog', file_path])
+            elif sys.platform.startswith('linux'):
+                subprocess.Popen(['xdg-open', file_path])
+            elif sys.platform.startswith('darwin'):
+                subprocess.Popen(['open', file_path])
+            elif sys.platform.startswith('win32'):
+                os.startfile(file_path)
+            logging.info(f"Opened media file: {file_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to open media file: {e}")
+            logging.error(f"Failed to open media file {file_path}: {e}")
+
+    def syncImageScroll(self):
+        """Schedule a debounced sync of the image scroll position"""
+        if not self.image_pane_visible:
+            return
+        self._scroll_sync_timer.start(self._scroll_sync_delay)
+
+    def _debounced_sync_scroll(self):
+        """Actually perform the scroll sync after the debounce delay"""
+        if not self.image_pane_visible:
+            return
+            
+        editor = self.currentEditor()
+        if not editor:
+            return
+
+        # Get the first and last visible blocks in the editor
+        first_block = editor.firstVisibleBlock()
+        viewport_height = editor.viewport().height()
+        last_block = editor.cursorForPosition(QPoint(0, viewport_height)).block()
+
+        first_line = first_block.blockNumber()
+        last_line = last_block.blockNumber()
+
+        # Find the first image that corresponds to a line in the visible range
+        target_pos = None
+        for line_num, widget in list(self.image_line_numbers.items()):
+            if not widget or not widget.isVisible():
+                continue
+            try:
+                if first_line <= line_num <= last_line:
+                    target_pos = widget.pos().y()
+                    break
+            except RuntimeError:
+                self.image_line_numbers.pop(line_num, None)
+                continue
+
+        # If we found a matching image, scroll to it
+        if target_pos is not None:
+            try:
+                self.image_scroll.verticalScrollBar().setValue(target_pos)
+            except RuntimeError:
+                pass
+
+    def toggleImagePane(self):
+        if self.image_pane_visible:
+            # Hide image pane
+            self.image_scroll.hide()
+            self.image_pane_visible = False
+            # Clear the image container to free resources
+            for i in reversed(range(self.image_layout.count())): 
+                widget = self.image_layout.itemAt(i).widget()
+                if widget is not None:
+                    widget.setParent(None)
+                    widget.deleteLater()
+        else:
+            # Show image pane
+            self.image_scroll.show()
+            self.image_pane_visible = True
+            # Update images if needed
+            self.updateImageDisplay()
+
+    def updateTitleSegments(self):
+        """Update the title segments pane with current document's title segments"""
+        # Clear existing buttons
+        while self.title_segments_layout_inner.count() > 0:  # Clear all widgets
+            item = self.title_segments_layout_inner.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        editor = self.currentEditor()
+        if not editor:
+            return
+            
+        # Get document text and find title segments
+        text = editor.toPlainText()
+        lines = text.splitlines()
+        segments = []  # List of (title, start_line, end_line)
+        current_segment = None
+        
+        # Get the visible lines range
+        first_block = editor.firstVisibleBlock()
+        first_line = first_block.blockNumber()
+        viewport_height = editor.viewport().height()
+        last_block = editor.cursorForPosition(QPoint(0, viewport_height)).block()
+        last_line = last_block.blockNumber()
+        
+        # First pass: collect all segments and their ranges
+        for i, line in enumerate(lines):
+            if re.match(r'^["\']?Title:', line.strip()):
+                if current_segment:
+                    segments.append((current_segment[0], current_segment[1], i - 1))
+                title = re.sub(r'^["\']?Title:', '', line.strip()).strip('"\'').strip()
+                current_segment = (title, i)
+        
+        # Add the last segment
+        if current_segment:
+            segments.append((current_segment[0], current_segment[1], len(lines) - 1))
+        
+        # Track visible buttons and the first visible segment index
+        visible_buttons = []
+        first_visible_segment_index = -1
+        
+        # Create buttons for each segment
+        for index, (title, start_line, end_line) in enumerate(segments):
+            btn = QPushButton(f"Title:{title}")
+            
+            # A segment is visible if:
+            # 1. Its title line is visible, OR
+            # 2. Any significant portion of its content is visible
+            title_visible = first_line <= start_line <= last_line
+            content_visible = (
+                (start_line <= first_line <= end_line) or  # Content starts before viewport
+                (start_line <= last_line <= end_line) or   # Content ends after viewport
+                (first_line <= start_line <= last_line)    # Title is in viewport
+            )
+            
+            is_visible = title_visible or content_visible
+            
+            # Track the first visible segment
+            if is_visible and first_visible_segment_index == -1:
+                first_visible_segment_index = index
+                
+            # Check if title contains the word "news" (case insensitive)
+            has_news = "news" in title.lower()
+            
+            # Determine text color: 
+            # - Orange if visible (overrides green)
+            # - Green if it contains "news" but is not visible
+            # - Grey if not visible and doesn't contain "news"
+            text_color = '#ff9933' if is_visible else ('#27a344' if has_news else '#d4d4d4')
+            
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    text-align: left;
+                    padding: 8px;
+                    border: none;
+                    background-color: #1e1e1e;
+                    color: {text_color};
+                    font-size: 14px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: #2d2d2d;
+                }}
+                QPushButton:pressed {{
+                    background-color: #3d3d3d;
+                }}
+            """)
+            
+            # Create a closure to capture the correct line_num
+            def make_click_handler(ln=start_line):
+                return lambda: self.scrollToLine(ln)
+            btn.clicked.connect(make_click_handler())
+            
+            # Add button to layout
+            self.title_segments_layout_inner.addWidget(btn)
+            
+            # Track visible buttons
+            if is_visible:
+                visible_buttons.append(btn)
+            
+        # Add stretch at the end
+        self.title_segments_layout_inner.addStretch()
+        
+        # Ensure the title segments are visible
+        self.title_segments_widget.show()
+        self.title_segments_scroll.show()
+        
+        # Scroll the title segments pane to show the visible titles
+        if first_visible_segment_index >= 0 and visible_buttons:
+            scroll_area = self.title_segments_scroll
+            first_visible_btn = visible_buttons[0]
+            
+            # Use QTimer to ensure the scroll happens after layout is complete
+            def center_visible_title():
+                try:
+                    btn_rect = first_visible_btn.geometry()
+                    viewport_height = scroll_area.viewport().height()
+                    global_btn_pos = first_visible_btn.mapTo(self.title_segments_container, QPoint(0, 0))
+                    target_pos = global_btn_pos.y() + (btn_rect.height() // 2) - (viewport_height // 2)
+                    target_pos = max(0, target_pos)
+                    scroll_area.verticalScrollBar().setValue(target_pos)
+                except RuntimeError:
+                    logging.warning("CenterVisibleTitle: QPushButton has been deleted; skipping centering.")
+            # Use a timer to ensure layout is complete before scrolling
+            QTimer.singleShot(50, center_visible_title)
+
+    def scrollToLine(self, line_num):
+        """Find the exact title line and position cursor at its end"""
+        editor = self.currentEditor()
+        if not editor:
+            return
+            
+        # Get the document text
+        text = editor.toPlainText()
+        lines = text.splitlines()
+        
+        # Find the exact title line by searching from the approximate position
+        title_line = None
+        search_range = range(max(0, line_num - 5), min(len(lines), line_num + 5))
+        for i in search_range:
+            if re.match(r'^["\']?Title:', lines[i].strip()):
+                # Add current line
+                title_line = i
+                break
+        
+        if title_line is not None:
+            # Calculate the position at the end of the title line
+            pos = 0
+            for i in range(title_line):
+                pos += len(lines[i]) + 1  # +1 for newline
+            pos += len(lines[title_line])  # Add length of the target line
+            
+            # Move cursor to the end of the title line
+            cursor = editor.textCursor()
+            cursor.setPosition(pos)
+            editor.setTextCursor(cursor)
+            editor.setFocus()
+            
+            # Ensure the cursor is visible
+            editor.ensureCursorVisible()
+
+    def check_for_mmm_lines(self):
+        editor = self.currentEditor()
+        if editor:
+            text = editor.toPlainText()
+            lines = text.splitlines()
+            for line in lines:
+                if line.startswith('mmm-'):
+                    # Extract text after 'mmm-'
+                    text_to_convert = line[4:].strip()
+                    logging.debug(f"Detected 'mmm-' line: {line}")
+                    # Look for image in the specified directory
+                    output_dir = '/home/j/Desktop/code/notepadmod/mmm/'
+                    image_path = os.path.join(output_dir, f"{text_to_convert}.png")
+                    if os.path.exists(image_path):
+                        logging.debug(f"Found image at: {image_path}")
+                        # Display image
+                        self.add_image_to_display(image_path, lines.index(line))
+                    else:
+                        logging.warning(f"Image not found for: {text_to_convert}")
+
+    def keyPressEvent(self, event):
+        super(NotepadWindow, self).keyPressEvent(event)
+        # Check for 'mmm-' lines on key press
+        self.check_for_mmm_lines()
+
+    def runTestModelScript(self):
+        """Run the test_model script on the selected text."""
+        self.script_runner.runTestModelScript()
+
+    def runTestModelExperimentalScript(self):
+        """Run the test_model_experimental script on the selected text."""
+        self.script_runner.runTestModelExperimentalScript()
+
+    def runTestModel3Script(self):
+        """Run the test_model_3 script on the selected text."""
+        self.script_runner.runTestModel3Script()
+
+    def runTestModel4Script(self):
+        """Run the test_model_4 script on the selected text."""
+        self.script_runner.runTestModel4Script()
+
+    def runTestModelJScript(self):
+        """Run the modelj script on the selected text."""
+        self.script_runner.runTestModelJScript()
+
+    def runModel2iScript(self):
+        # ... existing code for runModel2iScript ...
+        pass
+
+    def runSTBScript(self):
+        """Run the STB script on the current tab's text."""
+        self.script_runner.runSTBScript()
+
+    def runSTBCScript(self):
+        """Run the STBC script on the current tab's text."""
+        self.script_runner.runSTBCScript()
+
+    def runCleaner(self):
+        import os, time, shutil
+        # Perform backup of the current file
+        file_path = self.getCurrentFilePath()
+        if file_path:
+            backup_dir = '/home/j/Desktop/Finals/NotepadApp_backups/cleaner/'
+            os.makedirs(backup_dir, exist_ok=True)
+            base = os.path.basename(file_path)
+            name, ext = os.path.splitext(base)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            backup_file = os.path.join(backup_dir, f"{name}_cleaner_{timestamp}{ext}")
+            try:
+                shutil.copy(file_path, backup_file)
+            except Exception as e:
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Backup Error", f"Error creating backup: {e}")
+                return
+        else:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Error", "No file is currently open to backup.")
+            return
+
+        # Get the current editor's text
+        editor = self.currentEditor()
+        if not editor:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Error", "No editor available.")
+            return
+            
+        # Save the current cursor and scroll positions
+        cursor = editor.textCursor()
+        cursor_position = cursor.position()
+        scroll_value = editor.verticalScrollBar().value()
+        
+        text = editor.toPlainText()
+
+        # Define specific patterns to remove - only when they appear exactly as listed
+        patterns_to_remove = [
+            "cc-!!",
+            "cc-Wow",
+            "cc-Great news",
+            "cc-Yes",
+            "cc-Slava Ukraini",
+            "cc-#SlavaUkraini",
+            "cc-Yeah baby!",
+            "cc-",
+            "cc-Lol",
+            "cc-Good",
+            "cc-Sure",
+            "cc-!",
+            "cc-Super",
+            "cc-Nice",
+            "cc-Thank you, Heroiam Slava",
+            "cc-Well done",
+            "cc-YES",  # Added this line
+            "cc-we love this",
+            "cc-Absolutely",
+            "cc-Burn baby burn",
+            "cc-Fuck yea",
+            "cc-MORE",
+            "cc-Tragic",
+            "cc-Thoughts and prayers.",
+            "cc-Hahahahha",
+            "cc-Hoorah!",
+            "cc-Repeat"
+            
+            
+        ]
+        
+        # Remove only the exact lines
+        cleaned_lines = []
+        for line in text.splitlines():
+            line_stripped = line.strip()
+            
+            # Check if the line exactly matches one of the patterns to remove
+            if line_stripped in patterns_to_remove:
+                continue
+            cleaned_lines.append(line)
+
+        # Remove groups of exactly 4 consecutive empty lines
+        result_lines = []
+        empty_count = 0
+        for line in cleaned_lines:
+            if line.strip() == "":
+                empty_count += 1
+            else:
+                if empty_count:
+                    remainder = empty_count % 4
+                    result_lines.extend([""] * remainder)
+                    empty_count = 0
+                result_lines.append(line)
+        if empty_count:
+            remainder = empty_count % 4
+            result_lines.extend([""] * remainder)
+
+        new_text = "\n".join(result_lines)
+        
+        # Update the text while preserving cursor position
+        editor.setPlainText(new_text)
+        
+        # Restore cursor position, making sure it's within the valid range
+        new_cursor = editor.textCursor()
+        new_position = min(cursor_position, len(new_text))
+        new_cursor.setPosition(new_position)
+        editor.setTextCursor(new_cursor)
+        
+        # Restore scroll position
+        editor.verticalScrollBar().setValue(scroll_value)
+        
+        from PyQt5.QtWidgets import QMessageBox
+        QMessageBox.information(self, "Cleaner", "Cleaning complete and backup saved.")
+
+    def createNewButton(self):
+        """Create a New button for the menu bar"""
+        # Create a QToolButton instead of QAction
+        new_button = QToolButton(self)
+        new_button.setText("New")
+        new_button.setToolTip("Create a new tab")
+        new_button.clicked.connect(self.newTab)
+        
+        # Style the button to match the menubar exactly
+        new_button.setStyleSheet("""
+            QToolButton {
+                font-size: 32px;  /* Match menubar font size */
+                padding: 5px 15px;  /* Increased horizontal padding */
+                margin-top: 1px;   /* Fine-tune vertical alignment */
+                margin-left: 5px;  /* Add some space from the left edge */
+                background-color: transparent;
+                border: none;
+                color: rgb(200, 200, 200);  /* Match menu text color */
+                font-family: inherit;  /* Use the same font as menubar */
+            }
+            QToolButton:hover {
+                background-color: rgba(255, 255, 255, 30);
+            }
+            QToolButton:pressed {
+                background-color: rgba(255, 255, 255, 50);
+            }
+        """)
+            
+        # Add the button to the menu bar
+        menubar = self.menuBar()
+        menubar.setCornerWidget(None, Qt.TopLeftCorner)  # Clear any existing widget
+        menubar.setCornerWidget(new_button, Qt.TopLeftCorner)
+
+    def runGpsScript(self):
+        try:
+            self.statusBar().showMessage("GPS button or Alt+G hotkey pressed.", 2000)
+            logging.debug("GPS function triggered (button or Alt+G hotkey)")
+
+            editor = self.currentEditor()
+            if not editor:
+                logging.debug("GPS action called but no editor is open.")
+                self.statusBar().showMessage("No editor is open.", 2000)
+                return
+        
+            logging.debug("GPS button triggered with an open editor.")
+            cursor = editor.textCursor()
+            
+            # Check if there's selected text
+            selected_text = cursor.selectedText()
+            if selected_text.strip():
+                logging.debug("GPS script will run with selected text: %s", selected_text)
+                self.statusBar().showMessage("GPS script triggered with selected text", 5000)
+            else:
+                # No selection, use the current line
+                block = editor.document().findBlock(cursor.position())
+                text = block.text()
+                logging.debug("GPS script will run with line text: %s", text)
+                self.statusBar().showMessage("GPS script triggered with current line", 5000)
+
+            self.script_runner.runGpsScript()
+        except Exception as e:
+            logging.error("Error in runGpsScript: %s", str(e))
+            self.statusBar().showMessage("Error in GPS script: " + str(e), 5000)
+
+    def convertToDeepStateLink(self):
+        editor = self.currentEditor()
+        if not editor:
+            return
+
+        cursor = editor.textCursor()
+        # Store the current cursor position and scroll position
+        current_position = cursor.position()
+        scroll_bar = editor.verticalScrollBar()
+        scroll_position = scroll_bar.value()
+        
+        text = editor.toPlainText()
+        lines = text.splitlines()
+        
+        # Regular expression to match GPS coordinates
+        gps_pattern = re.compile(r'^(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$')
+        
+        # Process each line
+        new_lines = []
+        for line in lines:
+            match = gps_pattern.match(line.strip())
+            if match:
+                lat, lon = match.groups()
+                deepstate_link = f"https://deepstatemap.live/en#13/{lat}/{lon}"
+                new_lines.append(deepstate_link)
+            else:
+                new_lines.append(line)
+        
+        # Replace the text
+        new_text = '\n'.join(new_lines)
+        editor.setPlainText(new_text)
+        
+        # Restore cursor position and scroll position
+        new_cursor = editor.textCursor()
+        new_cursor.setPosition(current_position)
+        editor.setTextCursor(new_cursor)
+        scroll_bar.setValue(scroll_position)
+        
+        self.statusBar().showMessage("Converted GPS coordinates to DeepState links", 5000)
+
+    def run_usage_check(self):
+        """Check if the highlighted word makes sense in its sentence context."""
+        editor = self.currentEditor()
+        if not editor:
+            QMessageBox.warning(self, "No Editor", "No active editor found.")
+            return
+
+        # Get the cursor and check for selection
+        cursor = editor.textCursor()
+        highlighted_word = cursor.selectedText()
+
+        if not highlighted_word.strip():
+            QMessageBox.warning(self, "No Selection", "Please highlight a word to check its usage.")
+            return
+
+        # Get the full text of the editor
+        full_text = editor.toPlainText()
+
+        try:
+            # Create a temporary file with the highlighted word on first line and full text on second line
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp:
+                temp.write(f"{highlighted_word}\n{full_text}")
+                temp_path = temp.name
+
+            # Run usage_check.py with the temporary file
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            scripts_dir = os.path.join(project_root, "scripts")
+            usage_check_script = os.path.join(scripts_dir, "usage_check.py")
+            
+            if not os.path.exists(usage_check_script):
+                self.statusBar().showMessage(f"Usage check script not found: {usage_check_script}", 10000)
+                return
+                
+            # Run the script and capture its output
+            result = subprocess.run(
+                ["python3", usage_check_script, temp_path],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            # Clean up the temporary file
+            os.unlink(temp_path)
+
+            if result.returncode == 0:
+                # Get the API response from the output
+                output_lines = result.stdout.split('\n')
+                api_response = None
+                for line in output_lines:
+                    if "OpenAI API response:" in line:
+                        api_response = line.split("OpenAI API response:", 1)[1].strip()
+                        break
+                
+                if api_response:
+                    # Parse the response
+                    if api_response.startswith("MAKES_SENSE:"):
+                        message = api_response[len("MAKES_SENSE:"):].strip()
+                        msg = QMessageBox()
+                        msg.setIcon(QMessageBox.Information)
+                        msg.setWindowTitle("Usage Check Result")
+                        msg.setText(f"✓ The word '{highlighted_word}' makes sense in this context.\n\n{message}")
+                        msg.setMinimumSize(600, 400)
+                        msg.setStyleSheet("""
+                            QLabel { 
+                                font-size: 24pt; 
+                                color: #d4d4d4; 
+                                font-weight: bold;
+                            } 
+                            QMessageBox { 
+                                background-color: #2d2d2d; 
+                            }
+                        """)
+                        msg.exec_()
+                    elif api_response.startswith("DOES_NOT_MAKE_SENSE:"):
+                        parts = api_response[len("DOES_NOT_MAKE_SENSE:"):].split("|")
+                        explanation = parts[0].strip()
+                        suggestions = parts[1].strip() if len(parts) > 1 else ""
+                        
+                        # Parse suggestions into a list
+                        suggested_words = suggestions.split(',') if suggestions else []
+                        
+                        # Prepare the message with suggestions
+                        suggestion_text = ""
+                        if suggested_words:
+                            # Limit to 3 suggestions and strip whitespace
+                            suggested_words = [word.strip() for word in suggested_words[:3]]
+                            suggestion_text = "\n\nSuggested Alternatives:\n" + "\n".join(f"• {word}" for word in suggested_words)
+                        
+                        msg = QMessageBox()
+                        msg.setIcon(QMessageBox.Warning)
+                        msg.setWindowTitle("Usage Check Result")
+                        msg.setText(f"⚠ The word '{highlighted_word}' may not be appropriate in this context.\n\nExplanation: {explanation}{suggestion_text}")
+                        msg.setMinimumSize(600, 400)
+                        msg.setStyleSheet("""
+                            QLabel { 
+                                font-size: 24pt; 
+                                color: #d4d4d4; 
+                                font-weight: bold;
+                            } 
+                            QMessageBox { 
+                                background-color: #2d2d2d; 
+                            }
+                        """)
+                        msg.exec_()
+                    else:
+                        msg = QMessageBox()
+                        msg.setIcon(QMessageBox.Information)
+                        msg.setWindowTitle("Usage Check Result")
+                        msg.setText(api_response)
+                        msg.setMinimumSize(600, 400)
+                        msg.setStyleSheet("""
+                            QLabel { 
+                                font-size: 24pt; 
+                                color: #d4d4d4; 
+                                font-weight: bold;
+                            } 
+                            QMessageBox { 
+                                background-color: #2d2d2d; 
+                            }
+                        """)
+                        msg.exec_()
+                else:
+                    raise Exception("No API response found in output")
+            else:
+                error_msg = f"Script failed:\nExit code: {result.returncode}\nError: {result.stderr}\nOutput: {result.stdout}"
+                raise Exception(error_msg)
+            
+        except Exception as e:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Error")
+            msg.setText(f"Failed to analyze word usage:\n{str(e)}")
+            msg.setMinimumSize(600, 400)
+            msg.setStyleSheet("""
+                QLabel { 
+                    font-size: 24pt; 
+                    color: #d4d4d4; 
+                    font-weight: bold;
+                } 
+                QMessageBox { 
+                    background-color: #2d2d2d; 
+                }
+            """)
+            msg.exec_()
+
+    def run_academic_check(self):
+        """Check if the highlighted word makes sense in an academic context."""
+        editor = self.currentEditor()
+        if not editor:
+            QMessageBox.warning(self, "No Editor", "No active editor found.")
+            return
+
+        # Get the cursor and check for selection
+        cursor = editor.textCursor()
+        highlighted_word = cursor.selectedText()
+
+        if not highlighted_word.strip():
+            QMessageBox.warning(self, "No Selection", "Please highlight a word to check its academic usage.")
+            return
+
+        # Get the full text of the editor
+        full_text = editor.toPlainText()
+
+        try:
+            # Create a temporary file with the highlighted word on first line and full text on second line
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp:
+                temp.write(f"{highlighted_word}\n{full_text}")
+                temp_path = temp.name
+
+            # Run academic.py with the temporary file
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            scripts_dir = os.path.join(project_root, "scripts")
+            academic_script = os.path.join(scripts_dir, "academic.py")
+            
+            if not os.path.exists(academic_script):
+                self.statusBar().showMessage(f"Academic script not found: {academic_script}", 10000)
+                return
+                
+            # Run the script and capture its output
+            result = subprocess.run(
+                ["python3", academic_script, temp_path],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            # Clean up the temporary file
+            os.unlink(temp_path)
+
+            if result.returncode == 0:
+                # Get the API response from the output
+                output_lines = result.stdout.split('\n')
+                api_response = None
+                for line in output_lines:
+                    if "OpenAI API response:" in line:
+                        api_response = line.split("OpenAI API response:", 1)[1].strip()
+                        break
+                
+                if api_response:
+                    # Parse the response
+                    if api_response.startswith("MAKES_SENSE:"):
+                        message = api_response[len("MAKES_SENSE:"):].strip()
+                        msg = QMessageBox()
+                        msg.setIcon(QMessageBox.Information)
+                        msg.setWindowTitle("Academic Check Result")
+                        msg.setText(f"✓ The word '{highlighted_word}' is appropriate in academic context.\n\n{message}")
+                        msg.setMinimumSize(600, 400)
+                        msg.setStyleSheet("""
+                            QLabel { 
+                                font-size: 24pt; 
+                                color: #d4d4d4; 
+                                font-weight: bold;
+                            } 
+                            QMessageBox { 
+                                background-color: #2d2d2d; 
+                            }
+                        """)
+                        msg.exec_()
+                    elif api_response.startswith("DOES_NOT_MAKE_SENSE:"):
+                        parts = api_response[len("DOES_NOT_MAKE_SENSE:"):].split("|")
+                        explanation = parts[0].strip()
+                        suggestions = parts[1].strip() if len(parts) > 1 else ""
+                        
+                        # Parse suggestions into a list
+                        suggested_words = suggestions.split(',') if suggestions else []
+                        
+                        # Prepare the message with suggestions
+                        suggestion_text = ""
+                        if suggested_words:
+                            # Limit to 3 suggestions and strip whitespace
+                            suggested_words = [word.strip() for word in suggested_words[:3]]
+                            suggestion_text = "\n\nSuggested Alternatives:\n" + "\n".join(f"• {word}" for word in suggested_words)
+                        
+                        msg = QMessageBox()
+                        msg.setIcon(QMessageBox.Warning)
+                        msg.setWindowTitle("Academic Check Result")
+                        msg.setText(f"⚠ The word '{highlighted_word}' may not be appropriate in academic context.\n\nExplanation: {explanation}{suggestion_text}")
+                        msg.setMinimumSize(600, 400)
+                        msg.setStyleSheet("""
+                            QLabel { 
+                                font-size: 24pt; 
+                                color: #d4d4d4; 
+                                font-weight: bold;
+                            } 
+                            QMessageBox { 
+                                background-color: #2d2d2d; 
+                            }
+                        """)
+                        msg.exec_()
+                    else:
+                        msg = QMessageBox()
+                        msg.setIcon(QMessageBox.Information)
+                        msg.setWindowTitle("Academic Check Result")
+                        msg.setText(api_response)
+                        msg.setMinimumSize(600, 400)
+                        msg.setStyleSheet("""
+                            QLabel { 
+                                font-size: 24pt; 
+                                color: #d4d4d4; 
+                                font-weight: bold;
+                            } 
+                            QMessageBox { 
+                                background-color: #2d2d2d; 
+                            }
+                        """)
+                        msg.exec_()
+                else:
+                    raise Exception("No API response found in output")
+            else:
+                error_msg = f"Script failed:\nExit code: {result.returncode}\nError: {result.stderr}\nOutput: {result.stdout}"
+                raise Exception(error_msg)
+            
+        except Exception as e:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Error")
+            msg.setText(f"Failed to analyze academic word usage:\n{str(e)}")
+            msg.setMinimumSize(600, 400)
+            msg.setStyleSheet("""
+                QLabel { 
+                    font-size: 24pt; 
+                    color: #d4d4d4; 
+                    font-weight: bold;
+                } 
+                QMessageBox { 
+                    background-color: #2d2d2d; 
+                }
+            """)
+            msg.exec_()
+
+    def draftViewCount(self):
+        """Count the number of words in the current editor's document, excluding lines starting with specific prefixes"""
+        editor = self.currentEditor()
+        if not editor:
+            self.statusBar().showMessage("No active editor", 2000)
+            return
+
+        # Get the full text of the editor
+        full_text = editor.toPlainText()
+
+        # Prefixes to exclude from word count
+        prefixes = ("http", "cc-", "mm-", "jj-", "--", "Timestamp", "CC-", "MM-", "JJ-")
+        
+        # Filter out lines starting with excluded prefixes
+        valid_lines = [line for line in full_text.splitlines() if not line.strip().startswith(prefixes)]
+        valid_text = " ".join(valid_lines)
+        special_word_count = len(valid_text.split())
+
+        # Calculate document-wide statistics
+        all_words = full_text.split()
+        all_word_count = len(all_words)
+        all_char_count = len(full_text)
+        all_line_count = len(full_text.splitlines())
+
+        # Calculate special word count up to cursor position
+        cursor = editor.textCursor()
+        text_up_to_cursor = full_text[:cursor.position()]
+        
+        # Filter lines up to cursor, excluding specified prefixes
+        valid_lines_up_to_cursor = [
+            line for line in text_up_to_cursor.splitlines() 
+            if not line.strip().startswith(prefixes)
+        ]
+        valid_text_up_to_cursor = " ".join(valid_lines_up_to_cursor)
+        special_word_count_up_to_cursor = len(valid_text_up_to_cursor.split())
+
+        # Prepare the message with all statistics
+        message = (
+            f"Current Document Statistics:\n\n"
+            f"Current Word Count: {special_word_count}\n"
+            f"Word Count Up to Cursor: {special_word_count_up_to_cursor}\n"
+            f"All Word Count: {all_word_count}\n"
+            f"All Character Count: {all_char_count}\n"
+            f"All Line Count: {all_line_count}"
+        )
+
+        # Show the statistics in a message box
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Draft Count")
+        msg.setText(message)
+        msg.setMinimumSize(400, 300)
+        msg.setStyleSheet("""
+            QLabel { 
+                font-size: 14pt; 
+                color: #d4d4d4; 
+                font-weight: bold;
+            } 
+            QMessageBox { 
+                background-color: #2d2d2d; 
+            }
+        """)
+        msg.exec_()
+
+    def showMediaContextMenu(self, widget, pos):
+        from PyQt5.QtWidgets import QMenu
+        media_line = widget.property("media_line")
+        file_path = widget.property("file_path") # Assuming we store the file path on the widget
+
+        if not file_path: # Try finding the path via line number if not stored directly
+            editor = self.currentEditor()
+            if editor:
+                text = editor.toPlainText()
+                lines = text.splitlines()
+                if 0 <= media_line < len(lines):
+                    line_text = lines[media_line].strip()
+                    if line_text.startswith('--'):
+                        # Try to resolve the path from the line text
+                        possible_path = line_text.lstrip('-').strip()
+                        resolved_path = self.find_image_path(possible_path)
+                        if resolved_path:
+                            file_path = resolved_path
+
+
+        menu = QMenu(widget)
+
+        # Only add transcribe for non-media files (images)
+        if file_path and not self.is_media_file(file_path):
+             transcribe_action = menu.addAction("Transcribe")
+
+        delete_action = menu.addAction("Delete Media Link")
+
+        action = menu.exec_(widget.mapToGlobal(pos))
+
+        if action == delete_action:
+            self.deleteMediaLink(media_line)
+        elif 'transcribe_action' in locals() and action == transcribe_action:
+            if file_path:
+                self.transcribeImageAndInsert(file_path, media_line)
+            else:
+                QMessageBox.warning(self, "Error", "Could not determine image file path for transcription.")
+
+
+    def is_media_file(self, file_path):
+        """Check if the file is a video or audio file based on extension."""
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in self.media_extensions['video'] or ext in self.media_extensions['audio']
+
+    def transcribeImageAndInsert(self, image_path, image_line_num):
+        """Transcribes image using Ollama and inserts text into the corresponding editor segment."""
+        self.statusBar().showMessage(f"Transcribing {os.path.basename(image_path)}...", 0) # Persistent message
+        QApplication.processEvents() # Update UI
+
+        try:
+            transcribed_text = self.callOllamaVisionAPI(image_path)
+            if transcribed_text:
+                self.insertTextIntoSegment(image_line_num, transcribed_text)
+                self.statusBar().showMessage(f"Transcription complete for {os.path.basename(image_path)}.", 5000)
+            else:
+                 QMessageBox.warning(self, "Transcription Failed", "Received empty transcription from the model.")
+                 self.statusBar().showMessage("Transcription failed.", 5000)
+
+        except Exception as e:
+            logging.error(f"Transcription error for {image_path}: {e}")
+            QMessageBox.critical(self, "Transcription Error", f"Failed to transcribe image:\n{e}")
+            self.statusBar().showMessage("Transcription error.", 5000)
+
+
+    def callOllamaVisionAPI(self, image_path):
+        """Sends image to local Ollama vision model using the /api/chat endpoint and returns transcribed text."""
+        # --- IMPORTANT: Adjust this model name if needed ---
+        model_name = "granite3.2-vision" # Common Ollama vision model.
+        # Use the /api/chat endpoint, which is common for multimodal requests
+        ollama_url = "http://localhost:11434/api/chat"
+
+        try:
+            # Read and encode the image in Base64
+            with open(image_path, "rb") as image_file:
+                encoded_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+            # Payload structure for /api/chat
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Transcribe the text visible in this image. Only output the transcribed text.",
+                        "images": [encoded_image]
+                    }
+                ],
+                "stream": False # Get the full response at once
+            }
+
+            # Send request to Ollama API
+            logging.debug(f"Sending transcription request to {ollama_url} for model {model_name}")
+            response = requests.post(ollama_url, json=payload, timeout=60) # Added 60s timeout
+            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+
+            # Parse the response
+            response_data = response.json()
+            transcribed_text = response_data.get("response", "").strip()
+
+            logging.info(f"Ollama response for {os.path.basename(image_path)}: {transcribed_text[:100]}...") # Log start of response
+            return transcribed_text
+
+        except requests.exceptions.ConnectionError:
+             raise Exception("Connection Error: Could not connect to Ollama API at {ollama_url}. Is Ollama running?")
+        except requests.exceptions.Timeout:
+             raise Exception("Timeout Error: Request to Ollama API timed out.")
+        except requests.exceptions.RequestException as e:
+             raise Exception(f"Ollama API Request Error: {e}")
+        except Exception as e:
+             raise Exception(f"Error during transcription API call: {e}")
+
+
+    def insertTextIntoSegment(self, image_line_num, text_to_insert):
+        """Finds the segment containing the image line and inserts text below the Title line."""
+        editor = self.currentEditor()
+        if not editor:
+            return
+
+        document = editor.document()
+        content = document.toPlainText()
+        lines = content.splitlines()
+
+        # Find the 'Title:' line for the segment containing the image_line_num
+        segment_title_line_num = -1
+        for i in range(image_line_num, -1, -1):
+             if re.match(r'^["\']?Title:', lines[i].strip()):
+                 segment_title_line_num = i
+                 break
+
+        if segment_title_line_num == -1:
+            logging.warning(f"Could not find Title segment for image at line {image_line_num}")
+            QMessageBox.warning(self, "Error", "Could not find the corresponding 'Title:' segment for this image.")
+            return
+
+        # Calculate the insertion position (end of the Title line + newline)
+        insertion_pos = 0
+        for i in range(segment_title_line_num + 1):
+            insertion_pos += len(lines[i]) + 1 # +1 for the newline character
+
+        # Ensure the insertion position is valid
+        insertion_pos = min(insertion_pos, document.characterCount() -1) # -1 to avoid potential off-by-one at very end
+
+        # Insert the text
+        cursor = editor.textCursor()
+        cursor.setPosition(insertion_pos)
+        cursor.insertText(f"\n{text_to_insert}\n") # Add newlines before and after
+
+        logging.info(f"Inserted transcription below line {segment_title_line_num}")
+
+    def deleteMediaLink(self, line_number):
+        import re
+        editor = self.currentEditor()
+        if not editor:
+            return
+        
+        # Use the document to find the block corresponding to the given line number
+        block = editor.document().findBlockByNumber(line_number)
+        if not block.isValid():
+            return
+        
+        # Check if the block text matches a media link pattern
+        pattern = r'^--.*\.(png|jpg|jpeg|webp|mp4|webm)$'
+        block_text = block.text().strip()
+        if not re.match(pattern, block_text, re.IGNORECASE):
+            return
+        
+        # Save the current vertical scroll value
+        scroll_val = editor.verticalScrollBar().value()
+        
+        # Create a cursor, move it to the beginning of the block, and select the entire block including the newline
+        cursor = editor.textCursor()
+        cursor.beginEditBlock()
+        cursor.setPosition(block.position())
+        # Move to the next block to include the newline in selection
+        cursor.movePosition(cursor.NextBlock, cursor.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.endEditBlock()
+        
+        # Restore the previous scroll position after the layout updates
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(0, lambda: editor.verticalScrollBar().setValue(scroll_val))
+        
+        self.statusBar().showMessage("Media link deleted.", 5000)
+        self.updateImageDisplay()
+
+    def check_external_changes(self):
+        editor = self.currentEditor()
+        if editor:
+            filepath = editor.property("filepath")
+            if filepath and os.path.exists(filepath):
+                current_mtime = os.path.getmtime(filepath)
+                last_mtime = editor.property("last_modified_time")
+                logging.debug(f"check_external_changes: filepath={filepath}, last_modified_time={last_mtime}, current_mtime={current_mtime}")
+                if last_mtime is None:
+                    editor.setProperty("last_modified_time", current_mtime)
+                elif current_mtime != last_mtime:
+                    self.statusBar().setStyleSheet("color: red; font-weight: bold;")
+                    self.statusBar().showMessage("<span style='color:red; font-weight:bold;'>WARNING: File changed externally!</span>", 0)
+                    editor.setProperty("last_modified_time", current_mtime)
+
+    def save_file(self):
+        # ... existing save code ...
+        if success:
+            self.last_modified_time = os.path.getmtime(self.current_file)
+            self.statusBar().setStyleSheet("")
+            self.statusBar().showMessage(f"File saved successfully", 3000)
+
+    def save_as(self):
+        # ... existing save_as code ...
+        if success:
+            self.last_modified_time = os.path.getmtime(self.current_file)
+            self.statusBar().setStyleSheet("")
+            self.statusBar().showMessage(f"File saved successfully as {filename}", 3000)
+
+    def open_file(self):
+        # ... existing open_file code ...
+        if filename:
+            self.current_file = filename
+            self.last_modified_time = os.path.getmtime(filename)
+            # ... rest of existing open_file code ...
+
+    def runModifierScript(self):
+        pass
+
+    def runFgpsScript(self):
+        try:
+            self.statusBar().showMessage("fgps button pressed.", 2000)
+
+            editor = self.currentEditor()
+            if not editor:
+                logging.debug("fgps action called but no editor is open.")
+                self.statusBar().showMessage("No editor is open.", 2000)
+                return
+
+            logging.debug("fgps button triggered with an open editor.")
+            
+            # Get selected text (if any) or current line
+            cursor = editor.textCursor()
+            if cursor.hasSelection():
+                text = cursor.selectedText()
+                self.statusBar().showMessage("fgps script triggered with selected text", 5000)
+            else:
+                block = editor.document().findBlock(cursor.position())
+                text = block.text()
+                self.statusBar().showMessage("fgps script triggered with current line", 5000)
+
+            logging.debug("fgps script will run with text: %s", text)
+            self.script_runner.runGpsScript()  # Reusing the existing GPS script runner method
+        except Exception as e:
+            logging.error("Error in runFgpsScript: %s", str(e))
+            self.statusBar().showMessage("Error in fgps script: " + str(e), 5000)
+
+    def findAndCopyGpsCoordinates(self):
+        """
+        Scans the current document for GPS coordinates and copies them to the top of their segments.
+        A segment starts with a line matching the pattern "Title:{word}" and ends before the next segment header.
+        Prevents duplicating coordinates if they're already at the top of the segment.
+        Converts coordinates to decimal format.
+        """
+        try:
+            self.statusBar().showMessage("Scanning for GPS coordinates...", 2000)
+            
+            editor = self.currentEditor()
+            if not editor:
+                self.statusBar().showMessage("No editor is open.", 2000)
+                return
+                
+            # Get the entire document content
+            document = editor.document()
+            content = document.toPlainText()
+            
+            # Regular expression to find segment headers (Title:{word})
+            segment_header_pattern = r'"Title:(\w+)"'
+            
+            # Helper function to check if coordinates are approximately equal (within 0.001 degree)
+            def coords_approx_equal(coord1, coord2):
+                try:
+                    # Extract lat and lon as floats from coordinate strings
+                    lat1, lon1 = map(float, coord1.replace(' ', '').split(','))
+                    lat2, lon2 = map(float, coord2.replace(' ', '').split(','))
+                    
+                    # Check if they're within 0.001 degree (approximately 100 meters)
+                    return abs(lat1 - lat2) < 0.001 and abs(lon1 - lon2) < 0.001
+                except:
+                    # If parsing fails, fall back to string comparison
+                    return coord1 == coord2
+            
+            # Helper function to normalize and store a coordinate pair
+            def add_coordinate(lat, lon, coordinates_list):
+                # Format to 6 decimal places with consistent spacing
+                decimal_coords = f"{lat:.6f}, {lon:.6f}"
+                
+                # Check if a very similar coordinate already exists in our list
+                for existing_coord in coordinates_list:
+                    if coords_approx_equal(decimal_coords, existing_coord):
+                        return  # Skip this coordinate as a duplicate
+                
+                coordinates_list.append(decimal_coords)
+            
+            # Find all segment headers and their positions
+            segment_headers = [(m.group(), m.start()) for m in re.finditer(segment_header_pattern, content)]
+            
+            if not segment_headers:
+                self.statusBar().showMessage("No segments found with 'Title:{word}' pattern.", 3000)
+                return
+                
+            # Add the end of the document as a boundary for the last segment
+            segment_headers.append(("END_OF_DOCUMENT", len(content)))
+            
+            # Process each segment
+            modifications = []  # Store modifications to apply later
+            segments_with_new_coords = 0  # Count segments where we actually add new coordinates
+            
+            for i in range(len(segment_headers) - 1):
+                header, start_pos = segment_headers[i]
+                next_header_pos = segment_headers[i + 1][1]
+                
+                # Extract the segment
+                segment = content[start_pos:next_header_pos]
+                
+                # Skip processing URLs to avoid extracting numbers that look like coordinates
+                # Replace URLs to prevent coordinate extraction from them
+                segment_no_urls = re.sub(r'https?://[^\s]+', 'URL_REMOVED', segment)
+                
+                # Find the end of the header line
+                header_end = content.find('\n', start_pos)
+                if header_end == -1:  # If no newline is found
+                    header_end = start_pos + len(header)
+                else:
+                    header_end += 1  # Include the newline
+                
+                # Search for GPS coordinates in this segment
+                gps_coords_found = []
+                
+                # First, try to find DMS format coordinates
+                dms_pattern = r'(\d+)°\s*(\d+)[\'′]\s*(\d+(?:\.\d+)?)[\"″]\s*([NS])[,\s]+(\d+)°\s*(\d+)[\'′]\s*(\d+(?:\.\d+)?)[\"″]\s*([EW])'
+                dms_matches = list(re.finditer(dms_pattern, segment_no_urls))
+                
+                for match in dms_matches:
+                    # Extract DMS components
+                    lat_deg = int(match.group(1))
+                    lat_min = int(match.group(2))
+                    lat_sec = float(match.group(3))
+                    lat_dir = match.group(4)
+                    
+                    lon_deg = int(match.group(5))
+                    lon_min = int(match.group(6))
+                    lon_sec = float(match.group(7))
+                    lon_dir = match.group(8)
+                    
+                    # Convert DMS to decimal
+                    lat_decimal = lat_deg + (lat_min / 60) + (lat_sec / 3600)
+                    if lat_dir == 'S':
+                        lat_decimal = -lat_decimal
+                        
+                    lon_decimal = lon_deg + (lon_min / 60) + (lon_sec / 3600)
+                    if lon_dir == 'W':
+                        lon_decimal = -lon_decimal
+                    
+                    # Add to our list with deduplication
+                    add_coordinate(lat_decimal, lon_decimal, gps_coords_found)
+                    
+                # Next, find decimal degrees with directions
+                dd_dir_pattern = r'(\d+\.\d+)°?\s*([NS])[,\s]+(\d+\.\d+)°?\s*([EW])'
+                dd_dir_matches = list(re.finditer(dd_dir_pattern, segment_no_urls))
+                
+                for match in dd_dir_matches:
+                    lat = float(match.group(1))
+                    lat_dir = match.group(2)
+                    lon = float(match.group(3))
+                    lon_dir = match.group(4)
+                    
+                    if lat_dir == 'S':
+                        lat = -lat
+                    if lon_dir == 'W':
+                        lon = -lon
+                        
+                    add_coordinate(lat, lon, gps_coords_found)
+                
+                # Find plain decimal coordinates that are already in the right format
+                # More specific pattern to avoid capturing numbers that might not be coordinates
+                decimal_pattern = r'(?<![0-9.])([1-9][0-9](?:\.[0-9]{4,8}))[,\s]+([1-9][0-9](?:\.[0-9]{4,8}))(?![0-9.])'
+                decimal_matches = list(re.finditer(decimal_pattern, segment_no_urls))
+                
+                for match in decimal_matches:
+                    try:
+                        lat = float(match.group(1))
+                        lon = float(match.group(2))
+                        
+                        # Basic validation check - coordinates within reasonable range
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
+                            add_coordinate(lat, lon, gps_coords_found)
+                    except ValueError:
+                        continue  # Skip invalid numbers
+                
+                # Look for "location" or similar phrases followed by coordinates
+                location_coord_pattern = r'[Ll]ocation:.*?([1-9][0-9](?:\.[0-9]{4,8}))[,\s]+([1-9][0-9](?:\.[0-9]{4,8}))'
+                location_matches = list(re.finditer(location_coord_pattern, segment_no_urls))
+                
+                for match in location_matches:
+                    try:
+                        lat = float(match.group(1))
+                        lon = float(match.group(2))
+                        
+                        # Basic validation check
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
+                            add_coordinate(lat, lon, gps_coords_found)
+                    except ValueError:
+                        continue
+                
+                # Look for "was at" or similar phrases followed by coordinates
+                was_at_pattern = r'[Ww]as at:.*?([1-9][0-9](?:\.[0-9]{4,8}))[,\s]+([1-9][0-9](?:\.[0-9]{4,8}))'
+                was_at_matches = list(re.finditer(was_at_pattern, segment_no_urls))
+                
+                for match in was_at_matches:
+                    try:
+                        lat = float(match.group(1))
+                        lon = float(match.group(2))
+                        
+                        # Basic validation check
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
+                            add_coordinate(lat, lon, gps_coords_found)
+                    except ValueError:
+                        continue
+                
+                # If GPS coordinates are found
+                if gps_coords_found:
+                    # Check the beginning of the segment for existing coordinates
+                    # Extract a portion after header to check
+                    check_area_end = min(header_end + 500, next_header_pos)
+                    check_area = content[header_end:check_area_end]
+                    
+                    # Filter out coordinates that already exist at the top of the segment
+                    new_coords = []
+                    for coord in gps_coords_found:
+                        # Check if any existing coordinate in the check area is approximately equal
+                        existing_coords = re.findall(r'(\d+\.\d+),\s*(\d+\.\d+)', check_area)
+                        exists_already = False
+                        
+                        for existing_lat_str, existing_lon_str in existing_coords:
+                            existing_coord = f"{float(existing_lat_str):.6f}, {float(existing_lon_str):.6f}"
+                            if coords_approx_equal(coord, existing_coord):
+                                exists_already = True
+                                break
+                                
+                        if not exists_already:
+                            new_coords.append(coord)
+                    
+                    # If we have new coordinates to add
+                    if new_coords:
+                        # Prepare the text to insert (coordinates + newline)
+                        insert_text = '\n'.join(new_coords) + '\n'
+                        
+                        # Add this modification to our list
+                        modifications.append((header_end, insert_text))
+                        segments_with_new_coords += 1
+            
+            # Apply modifications in reverse order to avoid position shifts
+            modifications.sort(reverse=True)
+            
+            # Create a new cursor for editing
+            cursor = editor.textCursor()
+            cursor.beginEditBlock()
+            
+            for position, text in modifications:
+                cursor.setPosition(position)
+                cursor.insertText(text)
+            
+            cursor.endEditBlock()
+            
+            if modifications:
+                self.statusBar().showMessage(f"Added decimal GPS coordinates to {segments_with_new_coords} segments.", 3000)
+            else:
+                self.statusBar().showMessage("No new GPS coordinates to add.", 3000)
+                
+        except Exception as e:
+            logging.error("Error in findAndCopyGpsCoordinates: %s", str(e))
+            self.statusBar().showMessage(f"Error scanning for GPS coordinates: {str(e)}", 5000)
+
+    def transformWordToTitle(self):
+        """
+        Takes the word on the current line at cursor position and transforms it to "Title:{word}" format.
+        """
+        # Check if we have an active editor
+        if self.tabs.count() > 0:
+            editor = self.tabs.currentWidget()
+            
+            # Get the current cursor
+            cursor = editor.textCursor()
+            
+            # Get the current line
+            cursor.select(QTextCursor.LineUnderCursor)
+            line = cursor.selectedText().strip()
+            
+            # If there's text on the line
+            if line:
+                # Avoid double transformation
+                if line.startswith('"Title:') and line.endswith('"'):
+                    self.statusBar().showMessage("Line already in Title format", 2000)
+                    return
+                
+                # Format as "Title:{word}"
+                transformed_line = f'"Title:{line}"'
+                
+                # Replace the line with the transformed text
+                cursor.beginEditBlock()
+                cursor.removeSelectedText()
+                cursor.insertText(transformed_line)
+                cursor.endEditBlock()
+                
+                self.statusBar().showMessage(f"Transformed to {transformed_line}", 2000)
+            else:
+                self.statusBar().showMessage("No text on the current line", 2000)
+        else:
+            self.statusBar().showMessage("No active editor", 2000)
+
+    def showDraftCount(self):
+        """Show document-wide statistics including word, character, and line counts."""
+        editor = self.currentEditor()
+        if not editor:
+            QMessageBox.warning(self, "No Editor", "No active editor found.")
+            return
+
+        # Get the full text of the editor
+        full_text = editor.toPlainText()
+
+        # Calculate document-wide statistics
+        all_words = full_text.split()
+        all_word_count = len(all_words)
+        all_char_count = len(full_text)
+        all_line_count = len(full_text.splitlines())
+
+        # Prepare the message with all statistics
+        message = (
+            f"Current Document Statistics:\n\n"
+            f"Current Word Count: {len(editor.textCursor().selectedText().split()) if editor.textCursor().selectedText() else 0}\n"
+            f"All Word Count: {all_word_count}\n"
+            f"All Character Count: {all_char_count}\n"
+            f"All Line Count: {all_line_count}"
+        )
+
+        # Show the statistics in a message box
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Draft Count")
+        msg.setText(message)
+        msg.setMinimumSize(400, 300)
+        msg.setStyleSheet("""
+            QLabel { 
+                font-size: 14pt; 
+                color: #d4d4d4; 
+                font-weight: bold;
+            } 
+            QMessageBox { 
+                background-color: #2d2d2d; 
+            }
+        """)
+        msg.exec_()
+
+    def runReFlowScript(self):
+        """Remove the highlighted text and make the paragraph flow naturally."""
+        editor = self.currentEditor()
+        if not editor:
+            QMessageBox.warning(self, "No Editor", "No active editor found.")
+            return
+
+        # Get the cursor and check for selection
+        cursor = editor.textCursor()
+        highlighted_text = cursor.selectedText()
+        
+        # Log the highlighted text for debugging
+        logging.critical(f"ReFlow - Highlighted text length: {len(highlighted_text)}")
+        if len(highlighted_text) > 50:
+            logging.critical(f"ReFlow - Highlighted text start: {highlighted_text[:50]}...")
+        else:
+            logging.critical(f"ReFlow - Highlighted text: {highlighted_text}")
+
+        if not highlighted_text.strip():
+            QMessageBox.warning(self, "No Selection", "Please highlight the text you want to reflow.")
+            return
+
+        # Get the full text of the editor
+        full_text = editor.toPlainText()
+        logging.critical(f"ReFlow - Full text length: {len(full_text)}")
+
+        try:
+            # Create a temporary file with the highlighted text on first line and full text on second line
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp:
+                # Make sure we normalize line endings to avoid issues with QTextEdit
+                normalized_text = highlighted_text.replace('\u2029', '\n')
+                temp.write(f"{normalized_text}\n{full_text}")
+                temp_path = temp.name
+                logging.critical(f"ReFlow - Created temp file: {temp_path}")
+
+            # Run ReFlow.py with the temporary file
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            scripts_dir = os.path.join(project_root, "scripts")
+            reflow_script = os.path.join(scripts_dir, "ReFlow.py")
+            
+            if not os.path.exists(reflow_script):
+                error_msg = f"ReFlow script not found: {reflow_script}"
+                logging.critical(error_msg)
+                self.statusBar().showMessage(error_msg, 10000)
+                return
+            
+            logging.critical(f"ReFlow - Running script: {reflow_script}")
+                
+            # Run the script and capture its output
+            result = subprocess.run(
+                ["python3", reflow_script, temp_path],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+
+            # Clean up the temporary file
+            os.unlink(temp_path)
+            logging.critical(f"ReFlow - Script return code: {result.returncode}")
+
+            if result.returncode == 0:
+                # Get the reflowed text from the output
+                reflowed_text = result.stdout.strip()
+                
+                # Log the output for debugging
+                if reflowed_text:
+                    logging.critical(f"ReFlow - Output length: {len(reflowed_text)}")
+                    if len(reflowed_text) > 50:
+                        logging.critical(f"ReFlow - Output start: {reflowed_text[:50]}...")
+                    else:
+                        logging.critical(f"ReFlow - Output: {reflowed_text}")
+                else:
+                    logging.critical("ReFlow - No output received")
+                
+                if reflowed_text:
+                    # Only update if there was a change
+                    if reflowed_text != full_text:
+                        # Update the editor with the new text
+                        editor.setPlainText(reflowed_text)
+                        self.statusBar().showMessage("Text reflowed successfully", 5000)
+                        logging.critical("ReFlow - Editor text updated")
+                    else:
+                        self.statusBar().showMessage("No changes needed in the text", 5000)
+                        logging.critical("ReFlow - No changes made (texts identical)")
+                else:
+                    self.statusBar().showMessage("No output from ReFlow script", 5000)
+                    logging.critical("ReFlow - No output to update")
+            else:
+                error_msg = f"ReFlow script failed: {result.stderr}"
+                self.statusBar().showMessage(error_msg, 5000)
+                logging.critical(error_msg)
+                # Show stderr in popup for debugging
+                QMessageBox.warning(self, "ReFlow Error", f"Error: {result.stderr}")
+        except Exception as e:
+            error_msg = f"Error running ReFlow script: {str(e)}"
+            self.statusBar().showMessage(error_msg, 5000)
+            logging.critical(error_msg, exc_info=True)
+            QMessageBox.warning(self, "ReFlow Error", f"Error: {str(e)}")
+
+    def convertToTwitterSearch(self):
+        """
+        Create a Twitter search URL for the highlighted word and open it directly in Firefox
+        instead of inserting it as text in the editor.
+        """
+        editor = self.currentEditor()
+        if not editor:
+            return
+
+        # Get the cursor and check for selection
+        cursor = editor.textCursor()
+        highlighted_word = cursor.selectedText()
+
+        if not highlighted_word.strip():
+            QMessageBox.warning(self, "No Selection", "Please highlight a word to search on Twitter.")
+            return
+
+        # Create the Twitter search URL with the highlighted word
+        # We keep the 'lang:en' and other parameters as specified in the URL format
+        twitter_url = f"https://x.com/search?q=lang%3Aen%20{urllib.parse.quote(highlighted_word.strip())}&src=typed_query&f=live"
+        
+        try:
+            # Open the URL directly in Firefox using subprocess
+            import subprocess
+            subprocess.Popen(['firefox', twitter_url])
+            
+            self.statusBar().showMessage(f"Opened Twitter search for '{highlighted_word}' in Firefox", 5000)
+        except Exception as e:
+            error_msg = f"Error opening Firefox: {str(e)}"
+            self.statusBar().showMessage(error_msg, 5000)
+            logging.error(error_msg)
+            QMessageBox.warning(self, "Browser Error", f"Could not open Firefox: {str(e)}")
+
+    def runLastWordsScript(self):
+        """Run the LastWords script to complete the last sentence with 1-4 appropriate words."""
+        logging.critical("runLastWordsScript method called in NotepadWindow!")
+        print("DEBUG: runLastWordsScript method called in NotepadWindow!")
+        self.script_runner.runLastWordsScript()
+        
+    def runSkepticalOutroScript(self):
+        """Run the SkepticalOutro script to create a skeptical perspective of the selected text."""
+        logging.critical("runSkepticalOutroScript method called in NotepadWindow!")
+        print("DEBUG: runSkepticalOutroScript method called in NotepadWindow!")
+        self.script_runner.runSkepticalOutroScript()
+
+    def testButtonClicked(self):
+        """Test method to verify toolbar3 buttons are working"""
+        logging.debug("Test button clicked")
+        from PyQt5.QtWidgets import QMessageBox
+        QMessageBox.information(self, "Test Button", "Test button clicked successfully!")
+    
+    def runLastWords59Script(self):
+        """Run the LastWords59 script which completes the last sentence with 5-9 appropriate words."""
+        logging.critical("runLastWords59Script method called in NotepadWindow!")
+        print("DEBUG: runLastWords59Script method called in NotepadWindow!")
+        self.script_runner.runLastWords59Script()
+
+    def runDTMSScript(self):
+        """Run the DTMS script for data text management."""
+        logging.critical("runDTMSScript method called in NotepadWindow!")
+        print("DEBUG: runDTMSScript method called in NotepadWindow!")
+        self.script_runner.runDTMSScript()
+
+    def runGrammarX2Script(self):
+        """Run the GrammarX2 script for advanced grammar checking and correction."""
+        logging.critical("runGrammarX2Script method called in NotepadWindow!")
+        print("DEBUG: runGrammarX2Script method called in NotepadWindow!")
+        # This will be connected to a backend script later
+        self.statusBar().showMessage("GrammarX2 button clicked. Backend script will be implemented later.", 5000)
+
+    def runSTBCMiddleScript(self):
+        """Run the STBC-Middle script to rewrite content with balanced middle perspective."""
+        logging.critical("runSTBCMiddleScript method called in NotepadWindow!")
+        print("DEBUG: runSTBCMiddleScript method called in NotepadWindow!")
+        # Connect to the backend script
+        self.script_runner.runSTBCMiddleScript()
+
+    def runTempMaxCleaner(self):
+        """
+        Creates a backup of the current file and removes lines starting with specific prefixes.
+        Backup is saved to /home/j/Desktop/Finals/NotepadApp_backups/misc_backups/ with filename pattern {filename}_{HHMM}{am/pm}.vhd
+        Removes lines starting with: Timestamp:, cc-, --, http
+        Retains lines starting with "Title: (no longer replaces with +)
+        """
+        try:
+            # Get the current editor
+            editor = self.currentEditor()
+            if not editor:
+                logging.warning("TempMaxCleaner action triggered with no open editor.")
+                self.statusBar().showMessage("No file is open to clean.", 3000)
+                return
+            
+            # Get file path and name
+            file_path = editor.property("filepath")
+            if not file_path:
+                logging.warning("TempMaxCleaner: No file path for current editor.")
+                self.statusBar().showMessage("Please save the file before cleaning.", 3000)
+                return
+                
+            # Create backup directory if it doesn't exist
+            backup_dir = '/home/j/Desktop/Finals/NotepadApp_backups/misc_backups/'
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            # Get current time in HHMM am/pm format
+            current_time = time.strftime("%I%M%p").lower()  # e.g., "0345pm"
+            
+            # Create backup filename
+            base_filename = os.path.basename(file_path)
+            backup_filename = f"{os.path.splitext(base_filename)[0]}_{current_time}.vhd"
+            backup_path = os.path.join(backup_dir, backup_filename)
+            
+            # Save backup
+            with open(file_path, 'r', encoding='utf-8') as source_file:
+                content = source_file.read()
+                
+            with open(backup_path, 'w', encoding='utf-8') as backup_file:
+                backup_file.write(content)
+                
+            logging.info(f"TempMaxCleaner: Created backup at {backup_path}")
+            
+            # Save current cursor position and scroll value
+            cursor = editor.textCursor()
+            cursor_position = cursor.position()
+            scroll_value = editor.verticalScrollBar().value()
+            
+            # Process the text
+            lines = content.split('\n')
+            prefixes_to_remove = ["Timestamp:", "cc-", "--", "http"]
+            
+            # Process each line
+            cleaned_lines = []
+            removed_count = 0
+            
+            for line in lines:
+                stripped_line = line.strip()
+                
+                # Check for lines to remove completely
+                if any(stripped_line.startswith(prefix) for prefix in prefixes_to_remove):
+                    removed_count += 1
+                # Keep all other lines unchanged (including "Title: lines)
+                else:
+                    cleaned_lines.append(line)
+                    
+            cleaned_content = '\n'.join(cleaned_lines)
+            
+            # Update editor with cleaned content
+            editor.setPlainText(cleaned_content)
+            
+            # Restore cursor position and scroll value as closely as possible
+            new_cursor = editor.textCursor()
+            new_position = min(cursor_position, len(cleaned_content))
+            new_cursor.setPosition(new_position)
+            editor.setTextCursor(new_cursor)
+            editor.verticalScrollBar().setValue(scroll_value)
+            
+            # Update status
+            self.statusBar().showMessage(
+                f"TempMaxCleaner: Removed {removed_count} lines. Title lines retained. Backup saved.", 
+                5000
+            )
+            
+        except Exception as e:
+            logging.error(f"Error in TempMaxCleaner: {str(e)}")
+            self.statusBar().showMessage(f"Error in TempMaxCleaner: {str(e)}", 5000)
+
+    def runGpsCScript(self):
+        """
+        Extract GPS coordinates from selected text containing tweets or social media content.
+        Uses context-aware analysis to determine coordinates even from indirect location references.
+        """
+        logging.debug("gps-C button clicked - extracting coordinates from tweet content")
+        text = self.getSelectedText()
+        if not text:
+            QMessageBox.information(self, "gps-C", "Please select some text (tweets/content) first.")
+            return
+            
+        # Call the script runner method to process the text
+        self.script_runner.runGpsCScript()
