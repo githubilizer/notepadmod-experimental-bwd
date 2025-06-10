@@ -716,7 +716,14 @@ class NotepadWindow(QMainWindow):
         gpsc_action.triggered.connect(self.runGpsCScript)
         toolbar4.addAction(gpsc_action)
         logging.critical("Added gps-C button to toolbar4")
-        
+
+        # Add SpaceRmvr button to Main Toolbar 4
+        spaceremover_action = QAction("SpaceRmvr", self)
+        spaceremover_action.setToolTip("SpaceRmvr - Limit consecutive empty lines to three")
+        spaceremover_action.triggered.connect(self.runSpaceRmvr)
+        toolbar4.addAction(spaceremover_action)
+        logging.critical("Added SpaceRmvr button to toolbar4")
+
         self.addToolBar(Qt.TopToolBarArea, toolbar4)
 
     def createCpyImagesButton(self):
@@ -3596,6 +3603,42 @@ class NotepadWindow(QMainWindow):
         if not text:
             QMessageBox.information(self, "gps-C", "Please select some text (tweets/content) first.")
             return
-            
+
         # Call the script runner method to process the text
         self.script_runner.runGpsCScript()
+
+    def runSpaceRmvr(self):
+        """Limit consecutive empty lines to a maximum of three."""
+        editor = self.currentEditor()
+        if not editor:
+            QMessageBox.warning(self, "No Editor", "No active editor found.")
+            return
+
+        cursor = editor.textCursor()
+        cursor_pos = cursor.position()
+        scroll_value = editor.verticalScrollBar().value()
+
+        text = editor.toPlainText()
+
+        result_lines = []
+        empty_count = 0
+        for line in text.splitlines():
+            if line.strip() == "":
+                empty_count += 1
+                if empty_count <= 3:
+                    result_lines.append("")
+            else:
+                empty_count = 0
+                result_lines.append(line)
+
+        new_text = "\n".join(result_lines)
+
+        editor.setPlainText(new_text)
+
+        new_cursor = editor.textCursor()
+        new_position = min(cursor_pos, len(new_text))
+        new_cursor.setPosition(new_position)
+        editor.setTextCursor(new_cursor)
+        editor.verticalScrollBar().setValue(scroll_value)
+
+        self.statusBar().showMessage("Removed excessive empty lines", 5000)
