@@ -561,6 +561,12 @@ class Editor(QPlainTextEdit):
                 cursor.movePosition(QTextCursor.StartOfBlock)
                 self.setTextCursor(cursor)
                 self.ensureCursorVisible()
+                # Scroll so the found Title line is positioned at the top of the
+                # visible editor area
+                cursor_rect = self.cursorRect(cursor)
+                sb = self.verticalScrollBar()
+                new_val = sb.value() + cursor_rect.top()
+                sb.setValue(max(0, min(new_val, sb.maximum())))
                 return True
 
     def _send_to_vhd(self, target_file):
