@@ -137,6 +137,10 @@ class Editor(QPlainTextEdit):
         if event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_H:
             self.toggleSpecialLines()
             return
+        if event.key() == Qt.Key_F3:
+            moved = self.moveToNextTitleLine()
+            if moved:
+                return
         super().keyPressEvent(event)
         # Emit textChanged signal to trigger title segments update
         self.textChanged.emit()
@@ -542,6 +546,22 @@ class Editor(QPlainTextEdit):
                     vhd_files.append(os.path.join(desktop_path, fname))
         
         return sorted(vhd_files)
+
+    def moveToNextTitleLine(self):
+        """Move the cursor to the next line that begins with 'Title:'."""
+        cursor = self.textCursor()
+        while True:
+            if cursor.atEnd():
+                return False
+            cursor.movePosition(QTextCursor.Down)
+            if cursor.atEnd():
+                return False
+            line_text = cursor.block().text().strip()
+            if re.match(r'^\s*[\'"\"]?Title:', line_text, re.IGNORECASE):
+                cursor.movePosition(QTextCursor.StartOfBlock)
+                self.setTextCursor(cursor)
+                self.ensureCursorVisible()
+                return True
 
     def _send_to_vhd(self, target_file):
         """Send selected title segment to target file (.vhd or .txt) and remove original"""
