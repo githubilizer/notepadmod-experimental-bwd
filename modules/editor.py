@@ -560,13 +560,14 @@ class Editor(QPlainTextEdit):
             if re.match(r'^\s*[\'"\"]?Title:', line_text, re.IGNORECASE):
                 cursor.movePosition(QTextCursor.StartOfBlock)
                 self.setTextCursor(cursor)
-                self.ensureCursorVisible()
                 # Scroll so the found Title line is positioned at the top of the
-                # visible editor area
-                cursor_rect = self.cursorRect(cursor)
+                # visible editor area. Use layout coordinates so zoom levels are
+                # handled correctly.
+                layout = self.document().documentLayout()
+                block_top = layout.blockBoundingRect(cursor.block()).top()
                 sb = self.verticalScrollBar()
-                new_val = sb.value() + cursor_rect.top()
-                sb.setValue(max(0, min(new_val, sb.maximum())))
+                sb.setValue(max(0, min(int(block_top), sb.maximum())))
+                self.ensureCursorVisible()
                 return True
 
     def _send_to_vhd(self, target_file):
