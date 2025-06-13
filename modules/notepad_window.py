@@ -1646,30 +1646,28 @@ class NotepadWindow(QMainWindow):
         if current_segment:
             segments.append((current_segment[0], current_segment[1], len(lines) - 1, current_images))
 
-        # Find the current visible segment
-        visible_segments = []
-        
-        # Find all segments that are visible in the viewport
+        # Determine the segment that contains the top of the viewport
+        current_index = None
         for i, (title, start_line, end_line, images) in enumerate(segments):
-            # Check if the title line is visible
-            title_visible = (start_line <= last_line and start_line >= first_line)
-            
-            # Calculate how many lines of this segment are visible
-            segment_start = max(first_line, start_line)
-            segment_end = min(last_line, end_line)
-            visible_lines = segment_end - segment_start + 1
-            
-            # Show segment if:
-            # 1. Title is visible, OR
-            # 2. More than 10 lines are visible AND title is NOT visible
-            if title_visible or (visible_lines > 10 and not title_visible):
-                visible_segments.append((title, start_line, end_line, images))
-                # Also include the next segment if it exists and starts within the viewport
-                if i < len(segments) - 1:
-                    next_segment = segments[i + 1]
-                    if next_segment[1] <= last_line:
-                        visible_segments.append(next_segment)
-                        break  # Only show one next segment
+            if start_line <= first_line <= end_line:
+                current_index = i
+                break
+
+        # If no segment contains the first visible line, select the last
+        # segment whose start line is above the viewport
+        if current_index is None:
+            for i in reversed(range(len(segments))):
+                if first_line >= segments[i][1]:
+                    current_index = i
+                    break
+
+        # Build the list of segments to display: the current one and
+        # optionally the next one for context
+        visible_segments = []
+        if current_index is not None:
+            visible_segments.append(segments[current_index])
+            if current_index + 1 < len(segments):
+                visible_segments.append(segments[current_index + 1])
 
         # Display images for visible segments
         current_row = 0
